@@ -46,10 +46,10 @@ import (
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/pidfile"
 	"github.com/docker/docker/pkg/plugingetter"
+	"github.com/docker/docker/pkg/rootless"
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/plugin"
-	"github.com/docker/docker/rootless"
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/go-connections/tlsconfig"
 	"github.com/moby/buildkit/session"
@@ -139,13 +139,15 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	potentiallyUnderRuntimeDir := []string{cli.Config.ExecRoot}
 
 	if cli.Pidfile != "" {
-		pf, err := pidfile.New(cli.Pidfile)
-		if err != nil {
-			return errors.Wrap(err, "failed to start daemon")
+		if err = system.MkdirAll(filepath.Dir(cli.Pidfile), 0o755); err != nil {
+			return errors.Wrap(err, "failed to create pidfile directory")
+		}
+		if err = pidfile.Write(cli.Pidfile, os.Getpid()); err != nil {
+			return errors.Wrapf(err, "failed to start daemon, ensure docker is not running or delete %s", cli.Pidfile)
 		}
 		potentiallyUnderRuntimeDir = append(potentiallyUnderRuntimeDir, cli.Pidfile)
 		defer func() {
-			if err := pf.Remove(); err != nil {
+			if err := os.Remove(cli.Pidfile); err != nil {
 				logrus.Error(err)
 			}
 		}()
@@ -253,7 +255,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	// notify systemd that we're shutting down
 	notifyStopping()
-	shutdownDaemon(d)
+	shutdownDaemon(ctx, d)
 
 	// Stop notification processing and any background processes
 	cancel()
@@ -325,7 +327,6 @@ func newRouterOptions(config *config.Config, d *daemon.Daemon) (routerOptions, e
 
 func (cli *DaemonCli) reloadConfig() {
 	reload := func(c *config.Config) {
-
 		// Revalidate and reload the authorization plugins
 		if err := validateAuthzPlugins(c.AuthorizationPlugins, cli.d.PluginStore); err != nil {
 			logrus.Fatalf("Error validating authorization plugin: %v", err)
@@ -361,27 +362,24 @@ func (cli *DaemonCli) stop() {
 // shutdownDaemon just wraps daemon.Shutdown() to handle a timeout in case
 // d.Shutdown() is waiting too long to kill container or worst it's
 // blocked there
-func shutdownDaemon(d *daemon.Daemon) {
-	shutdownTimeout := d.ShutdownTimeout()
-	ch := make(chan struct{})
-	go func() {
-		d.Shutdown()
-		close(ch)
-	}()
-	if shutdownTimeout < 0 {
-		<-ch
-		logrus.Debug("Clean shutdown succeeded")
-		return
+func shutdownDaemon(ctx context.Context, d *daemon.Daemon) {
+	var cancel context.CancelFunc
+	if timeout := d.ShutdownTimeout(); timeout >= 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
 
-	timeout := time.NewTimer(time.Duration(shutdownTimeout) * time.Second)
-	defer timeout.Stop()
+	go func() {
+		defer cancel()
+		d.Shutdown(ctx)
+	}()
 
-	select {
-	case <-ch:
-		logrus.Debug("Clean shutdown succeeded")
-	case <-timeout.C:
+	<-ctx.Done()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		logrus.Error("Force shutdown daemon")
+	} else {
+		logrus.Debug("Clean shutdown succeeded")
 	}
 }
 
@@ -407,21 +405,13 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 	}
 
 	if opts.TLSOptions != nil {
-		conf.CommonTLSOptions = config.CommonTLSOptions{
+		conf.TLSOptions = config.TLSOptions{
 			CAFile:   opts.TLSOptions.CAFile,
 			CertFile: opts.TLSOptions.CertFile,
 			KeyFile:  opts.TLSOptions.KeyFile,
 		}
 	} else {
-		conf.CommonTLSOptions = config.CommonTLSOptions{}
-	}
-
-	if conf.TrustKeyPath == "" {
-		daemonConfDir, err := getDaemonConfDir(conf.Root)
-		if err != nil {
-			return nil, err
-		}
-		conf.TrustKeyPath = filepath.Join(daemonConfDir, defaultTrustKeyFile)
+		conf.TLSOptions = config.TLSOptions{}
 	}
 
 	if opts.configFile != "" {
@@ -619,9 +609,9 @@ func newAPIServerConfig(config *config.Config) (*apiserver.Config, error) {
 			clientAuth = tls.RequireAndVerifyClientCert
 		}
 		tlsConfig, err = tlsconfig.Server(tlsconfig.Options{
-			CAFile:             config.CommonTLSOptions.CAFile,
-			CertFile:           config.CommonTLSOptions.CertFile,
-			KeyFile:            config.CommonTLSOptions.KeyFile,
+			CAFile:             config.TLSOptions.CAFile,
+			CertFile:           config.TLSOptions.CertFile,
+			KeyFile:            config.TLSOptions.KeyFile,
 			ExclusiveRootPools: true,
 			ClientAuth:         clientAuth,
 		})
@@ -672,12 +662,10 @@ func loadListeners(cli *DaemonCli, serverConfig *apiserver.Config) ([]string, er
 
 	for i := 0; i < len(serverConfig.Hosts); i++ {
 		protoAddr := serverConfig.Hosts[i]
-		protoAddrParts := strings.SplitN(serverConfig.Hosts[i], "://", 2)
-		if len(protoAddrParts) != 2 {
+		proto, addr, ok := strings.Cut(protoAddr, "://")
+		if !ok || addr == "" {
 			return nil, fmt.Errorf("bad format %s, expected PROTO://ADDR", protoAddr)
 		}
-
-		proto, addr := protoAddrParts[0], protoAddrParts[1]
 
 		// It's a bad idea to bind to TCP without tlsverify.
 		authEnabled := serverConfig.TLSConfig != nil && serverConfig.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert
@@ -729,7 +717,7 @@ func loadListeners(cli *DaemonCli, serverConfig *apiserver.Config) ([]string, er
 			return nil, err
 		}
 		logrus.Debugf("Listener created for HTTP on %s (%s)", proto, addr)
-		hosts = append(hosts, protoAddrParts[1])
+		hosts = append(hosts, addr)
 		cli.api.Accept(addr, ls...)
 	}
 

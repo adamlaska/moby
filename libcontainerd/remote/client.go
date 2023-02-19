@@ -213,9 +213,9 @@ func (c *container) Start(ctx context.Context, checkpointDir string, withStdin b
 
 	t, err = c.c8dCtr.NewTask(ctx,
 		func(id string) (cio.IO, error) {
-			fifos := newFIFOSet(bundle, libcontainerdtypes.InitProcessName, withStdin, spec.Process.Terminal)
+			fifos := newFIFOSet(bundle, id, withStdin, spec.Process.Terminal)
 
-			rio, err = c.createIO(fifos, libcontainerdtypes.InitProcessName, stdinCloseSync, attachStdio)
+			rio, err = c.createIO(fifos, stdinCloseSync, attachStdio)
 			return rio, err
 		},
 		taskOpts...,
@@ -233,7 +233,9 @@ func (c *container) Start(ctx context.Context, checkpointDir string, withStdin b
 	stdinCloseSync <- t
 
 	if err := t.Start(ctx); err != nil {
-		if _, err := t.Delete(ctx); err != nil {
+		// Only Stopped tasks can be deleted. Created tasks have to be
+		// killed first, to transition them to Stopped.
+		if _, err := t.Delete(ctx, containerd.WithProcessKill); err != nil {
 			c.client.logger.WithError(err).WithField("container", c.c8dCtr.ID()).
 				Error("failed to delete task after fail start")
 		}
@@ -276,7 +278,7 @@ func (t *task) Exec(ctx context.Context, processID string, spec *specs.Process, 
 	}()
 
 	p, err = t.Task.Exec(ctx, processID, spec, func(id string) (cio.IO, error) {
-		rio, err = t.ctr.createIO(fifos, processID, stdinCloseSync, attachStdio)
+		rio, err = t.ctr.createIO(fifos, stdinCloseSync, attachStdio)
 		return rio, err
 	})
 	if err != nil {
@@ -487,7 +489,7 @@ func (c *container) Task(ctx context.Context) (libcontainerdtypes.Task, error) {
 
 // createIO creates the io to be used by a process
 // This needs to get a pointer to interface as upon closure the process may not have yet been registered
-func (c *container) createIO(fifos *cio.FIFOSet, processID string, stdinCloseSync chan containerd.Process, attachStdio libcontainerdtypes.StdioCallback) (cio.IO, error) {
+func (c *container) createIO(fifos *cio.FIFOSet, stdinCloseSync chan containerd.Process, attachStdio libcontainerdtypes.StdioCallback) (cio.IO, error) {
 	var (
 		io  *cio.DirectIO
 		err error

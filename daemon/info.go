@@ -18,7 +18,6 @@ import (
 	"github.com/docker/docker/pkg/parsers/operatingsystem"
 	"github.com/docker/docker/pkg/platform"
 	"github.com/docker/docker/pkg/sysinfo"
-	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/registry"
 	metrics "github.com/docker/go-metrics"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -206,9 +205,7 @@ func (daemon *Daemon) fillAPIInfo(v *types.Info) {
 	cfg := daemon.configStore
 	for _, host := range cfg.Hosts {
 		// cnf.Hosts is normalized during startup, so should always have a scheme/proto
-		h := strings.SplitN(host, "://", 2)
-		proto := h[0]
-		addr := h[1]
+		proto, addr, _ := strings.Cut(host, "://")
 		if proto != "tcp" {
 			continue
 		}
@@ -252,11 +249,11 @@ func kernelVersion() string {
 	return kernelVersion
 }
 
-func memInfo() *system.MemInfo {
-	memInfo, err := system.ReadMemInfo()
+func memInfo() *sysinfo.Memory {
+	memInfo, err := sysinfo.ReadMemInfo()
 	if err != nil {
 		logrus.Errorf("Could not read system memory info: %v", err)
-		memInfo = &system.MemInfo{}
+		memInfo = &sysinfo.Memory{}
 	}
 	return memInfo
 }

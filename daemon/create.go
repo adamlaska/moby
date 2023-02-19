@@ -18,7 +18,6 @@ import (
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/runconfig"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/selinux/go-selinux"
@@ -34,32 +33,30 @@ type createOpts struct {
 }
 
 // CreateManagedContainer creates a container that is managed by a Service
-func (daemon *Daemon) CreateManagedContainer(params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
-	return daemon.containerCreate(createOpts{
-		params:                  params,
-		managed:                 true,
-		ignoreImagesArgsEscaped: false})
+func (daemon *Daemon) CreateManagedContainer(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
+	return daemon.containerCreate(ctx, createOpts{
+		params:  params,
+		managed: true,
+	})
 }
 
 // ContainerCreate creates a regular container
-func (daemon *Daemon) ContainerCreate(params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
-	return daemon.containerCreate(createOpts{
-		params:                  params,
-		managed:                 false,
-		ignoreImagesArgsEscaped: false})
+func (daemon *Daemon) ContainerCreate(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
+	return daemon.containerCreate(ctx, createOpts{
+		params: params,
+	})
 }
 
 // ContainerCreateIgnoreImagesArgsEscaped creates a regular container. This is called from the builder RUN case
 // and ensures that we do not take the images ArgsEscaped
-func (daemon *Daemon) ContainerCreateIgnoreImagesArgsEscaped(params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
-	return daemon.containerCreate(createOpts{
+func (daemon *Daemon) ContainerCreateIgnoreImagesArgsEscaped(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
+	return daemon.containerCreate(ctx, createOpts{
 		params:                  params,
-		managed:                 false,
-		ignoreImagesArgsEscaped: true})
+		ignoreImagesArgsEscaped: true,
+	})
 }
 
-func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.CreateResponse, error) {
-	ctx := context.TODO()
+func (daemon *Daemon) containerCreate(ctx context.Context, opts createOpts) (containertypes.CreateResponse, error) {
 	start := time.Now()
 	if opts.params.Config == nil {
 		return containertypes.CreateResponse{}, errdefs.InvalidParameter(errors.New("Config cannot be empty in order to create a container"))
@@ -102,7 +99,7 @@ func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.CreateRes
 		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	ctr, err := daemon.create(opts)
+	ctr, err := daemon.create(ctx, opts)
 	if err != nil {
 		return containertypes.CreateResponse{Warnings: warnings}, err
 	}
@@ -116,8 +113,7 @@ func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.CreateRes
 }
 
 // Create creates a new container from the given configuration with a given name.
-func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr error) {
-	ctx := context.TODO()
+func (daemon *Daemon) create(ctx context.Context, opts createOpts) (retC *container.Container, retErr error) {
 	var (
 		ctr   *container.Container
 		img   *image.Image
@@ -132,9 +128,6 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 			return nil, err
 		}
 		os = img.OperatingSystem()
-		if !system.IsOSSupported(os) {
-			return nil, system.ErrNotSupportedOperatingSystem
-		}
 		imgID = img.ID()
 	} else if isWindows {
 		os = "linux" // 'scratch' case.
@@ -177,12 +170,18 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 
 	ctr.HostConfig.StorageOpt = opts.params.HostConfig.StorageOpt
 
-	// Set RWLayer for container after mount labels have been set
-	rwLayer, err := daemon.imageService.CreateLayer(ctr, setupInitLayer(daemon.idMapping))
-	if err != nil {
-		return nil, errdefs.System(err)
+	if daemon.UsesSnapshotter() {
+		if err := daemon.imageService.PrepareSnapshot(ctx, ctr.ID, opts.params.Config.Image, opts.params.Platform); err != nil {
+			return nil, err
+		}
+	} else {
+		// Set RWLayer for container after mount labels have been set
+		rwLayer, err := daemon.imageService.CreateLayer(ctr, setupInitLayer(daemon.idMapping))
+		if err != nil {
+			return nil, errdefs.System(err)
+		}
+		ctr.RWLayer = rwLayer
 	}
-	ctr.RWLayer = rwLayer
 
 	current := idtools.CurrentIdentity()
 	if err := idtools.MkdirAndChown(ctr.Root, 0710, idtools.Identity{UID: current.UID, GID: daemon.IdentityMapping().RootPair().GID}); err != nil {

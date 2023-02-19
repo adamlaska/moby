@@ -28,10 +28,10 @@ import (
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
+	"github.com/docker/docker/oci"
 	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/restartmanager"
 	"github.com/docker/docker/volume"
 	volumemounts "github.com/docker/docker/volume/mounts"
@@ -61,10 +61,10 @@ type ExitStatus struct {
 type Container struct {
 	StreamConfig *stream.Config
 	// embed for Container to support states directly.
-	*State          `json:"State"`          // Needed for Engine API version <= 1.11
-	Root            string                  `json:"-"` // Path to the "home" of the container, including metadata.
-	BaseFS          containerfs.ContainerFS `json:"-"` // interface containing graphdriver mount
-	RWLayer         layer.RWLayer           `json:"-"`
+	*State          `json:"State"` // Needed for Engine API version <= 1.11
+	Root            string         `json:"-"` // Path to the "home" of the container, including metadata.
+	BaseFS          string         `json:"-"` // Path to the graphdriver mountpoint
+	RWLayer         layer.RWLayer  `json:"-"`
 	ID              string
 	Created         time.Time
 	Managed         bool
@@ -93,7 +93,7 @@ type Container struct {
 	// logDriver for closing
 	LogDriver      logger.Logger  `json:"-"`
 	LogCopier      *logger.Copier `json:"-"`
-	restartManager restartmanager.RestartManager
+	restartManager *restartmanager.RestartManager
 	attachContext  *attachContext
 
 	// Fields here are specific to Unix platforms
@@ -193,7 +193,7 @@ func (container *Container) toDisk() (*Container, error) {
 
 // CheckpointTo makes the Container's current state visible to queries, and persists state.
 // Callers must hold a Container lock.
-func (container *Container) CheckpointTo(store ViewDB) error {
+func (container *Container) CheckpointTo(store *ViewDB) error {
 	deepCopy, err := container.toDisk()
 	if err != nil {
 		return err
@@ -299,18 +299,18 @@ func (container *Container) SetupWorkingDirectory(rootIdentity idtools.Identity)
 // symlinking to a different path) between using this method and using the
 // path. See symlink.FollowSymlinkInScope for more details.
 func (container *Container) GetResourcePath(path string) (string, error) {
-	if container.BaseFS == nil {
-		return "", errors.New("GetResourcePath: BaseFS of container " + container.ID + " is unexpectedly nil")
+	if container.BaseFS == "" {
+		return "", errors.New("GetResourcePath: BaseFS of container " + container.ID + " is unexpectedly empty")
 	}
 	// IMPORTANT - These are paths on the OS where the daemon is running, hence
 	// any filepath operations must be done in an OS agnostic way.
-	r, e := container.BaseFS.ResolveScopedPath(path, false)
+	r, e := containerfs.ResolveScopedPath(container.BaseFS, containerfs.CleanScopedPath(path))
 
 	// Log this here on the daemon side as there's otherwise no indication apart
 	// from the error being propagated all the way back to the client. This makes
 	// debugging significantly easier and clearly indicates the error comes from the daemon.
 	if e != nil {
-		logrus.Errorf("Failed to ResolveScopedPath BaseFS %s path %s %s\n", container.BaseFS.Path(), path, e)
+		logrus.Errorf("Failed to ResolveScopedPath BaseFS %s path %s %s\n", container.BaseFS, path, e)
 	}
 	return r, e
 }
@@ -557,13 +557,7 @@ func (container *Container) InitDNSHostConfig() {
 
 // UpdateMonitor updates monitor configure for running container
 func (container *Container) UpdateMonitor(restartPolicy containertypes.RestartPolicy) {
-	type policySetter interface {
-		SetPolicy(containertypes.RestartPolicy)
-	}
-
-	if rm, ok := container.RestartManager().(policySetter); ok {
-		rm.SetPolicy(restartPolicy)
-	}
+	container.RestartManager().SetPolicy(restartPolicy)
 }
 
 // FullHostname returns hostname and optional domain appended to it.
@@ -576,7 +570,7 @@ func (container *Container) FullHostname() string {
 }
 
 // RestartManager returns the current restartmanager instance connected to container.
-func (container *Container) RestartManager() restartmanager.RestartManager {
+func (container *Container) RestartManager() *restartmanager.RestartManager {
 	if container.restartManager == nil {
 		container.restartManager = restartmanager.New(container.HostConfig.RestartPolicy, container.RestartCount)
 	}
@@ -737,7 +731,7 @@ func (container *Container) CreateDaemonEnvironment(tty bool, linkedEnv []string
 
 	env := make([]string, 0, envSize)
 	if runtime.GOOS != "windows" {
-		env = append(env, "PATH="+system.DefaultPathEnv(ctrOS))
+		env = append(env, "PATH="+oci.DefaultPathEnv(ctrOS))
 		env = append(env, "HOSTNAME="+container.Config.Hostname)
 		if tty {
 			env = append(env, "TERM=xterm")

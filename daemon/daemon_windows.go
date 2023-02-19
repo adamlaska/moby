@@ -23,7 +23,6 @@ import (
 	winlibnetwork "github.com/docker/docker/libnetwork/drivers/windows"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/options"
-	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/parsers/operatingsystem"
@@ -39,7 +38,6 @@ import (
 
 const (
 	isWindows            = true
-	platformSupported    = true
 	windowsMinCPUShares  = 1
 	windowsMaxCPUShares  = 10000
 	windowsMinCPUPercent = 1
@@ -56,15 +54,15 @@ func adjustParallelLimit(n int, limit int) int {
 }
 
 // Windows has no concept of an execution state directory. So use config.Root here.
-func getPluginExecRoot(root string) string {
-	return filepath.Join(root, "plugins")
+func getPluginExecRoot(cfg *config.Config) string {
+	return filepath.Join(cfg.Root, "plugins")
 }
 
 func (daemon *Daemon) parseSecurityOpt(container *container.Container, hostConfig *containertypes.HostConfig) error {
 	return nil
 }
 
-func setupInitLayer(idMapping idtools.IdentityMapping) func(containerfs.ContainerFS) error {
+func setupInitLayer(idMapping idtools.IdentityMapping) func(string) error {
 	return nil
 }
 
@@ -411,7 +409,7 @@ func (daemon *Daemon) initNetworkController(activeSandboxes map[string]interface
 	return nil
 }
 
-func initBridgeDriver(controller libnetwork.NetworkController, config *config.Config) error {
+func initBridgeDriver(controller *libnetwork.Controller, config *config.Config) error {
 	if _, err := controller.NetworkByName(runconfig.DefaultDaemonNetworkMode().NetworkName()); err == nil {
 		return nil
 	}

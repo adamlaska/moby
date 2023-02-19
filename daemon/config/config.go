@@ -11,6 +11,10 @@ import (
 	"strings"
 	"sync"
 
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
+
 	"github.com/containerd/containerd/runtime/v2/shim"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/authorization"
@@ -24,11 +28,11 @@ import (
 const (
 	// DefaultMaxConcurrentDownloads is the default value for
 	// maximum number of downloads that
-	// may take place at a time for each pull.
+	// may take place at a time.
 	DefaultMaxConcurrentDownloads = 3
 	// DefaultMaxConcurrentUploads is the default value for
 	// maximum number of uploads that
-	// may take place at a time for each push.
+	// may take place at a time.
 	DefaultMaxConcurrentUploads = 5
 	// DefaultDownloadAttempts is the default value for
 	// maximum number of attempts that
@@ -71,7 +75,7 @@ var builtinRuntimes = map[string]bool{
 // flatOptions contains configuration keys
 // that MUST NOT be parsed as deep structures.
 // Use this to differentiate these options
-// with others like the ones in CommonTLSOptions.
+// with others like the ones in TLSOptions.
 var flatOptions = map[string]bool{
 	"cluster-store-opts": true,
 	"log-opts":           true,
@@ -124,10 +128,10 @@ type NetworkConfig struct {
 	NetworkControlPlaneMTU int `json:"network-control-plane-mtu,omitempty"`
 }
 
-// CommonTLSOptions defines TLS configuration for the daemon server.
+// TLSOptions defines TLS configuration for the daemon server.
 // It includes json tags to deserialize configuration from a file
 // using the same names that the flags in the command line use.
-type CommonTLSOptions struct {
+type TLSOptions struct {
 	CAFile   string `json:"tlscacert,omitempty"`
 	CertFile string `json:"tlscert,omitempty"`
 	KeyFile  string `json:"tlskey,omitempty"`
@@ -159,7 +163,6 @@ type CommonConfig struct {
 	NetworkDiagnosticPort int                       `json:"network-diagnostic-port,omitempty"`
 	Pidfile               string                    `json:"pidfile,omitempty"`
 	RawLogs               bool                      `json:"raw-logs,omitempty"`
-	RootDeprecated        string                    `json:"graph,omitempty"` // Deprecated: use Root instead. TODO(thaJeztah): remove in next release.
 	Root                  string                    `json:"data-root,omitempty"`
 	ExecRoot              string                    `json:"exec-root,omitempty"`
 	SocketGroup           string                    `json:"group,omitempty"`
@@ -167,12 +170,6 @@ type CommonConfig struct {
 
 	// Proxies holds the proxies that are configured for the daemon.
 	Proxies `json:"proxies"`
-
-	// TrustKeyPath is used to generate the daemon ID and for signing schema 1 manifests
-	// when pushing to a registry which does not support schema 2. This field is marked as
-	// deprecated because schema 1 manifests are deprecated in favor of schema 2 and the
-	// daemon ID will use a dedicated identifier not shared with exported signatures.
-	TrustKeyPath string `json:"deprecated-key-path,omitempty"`
 
 	// LiveRestoreEnabled determines whether we should keep containers
 	// alive upon daemon shutdown/start
@@ -202,7 +199,7 @@ type CommonConfig struct {
 
 	// Embedded structs that allow config
 	// deserialization without the full struct.
-	CommonTLSOptions
+	TLSOptions
 
 	// SwarmDefaultAdvertiseAddr is the default host/IP or network interface
 	// to use if a wildcard address is specified in the ListenAddr value
@@ -224,7 +221,7 @@ type CommonConfig struct {
 
 	DNSConfig
 	LogConfig
-	BridgeConfig // bridgeConfig holds bridge network specific configuration.
+	BridgeConfig // BridgeConfig holds bridge network specific configuration.
 	NetworkConfig
 	registry.ServiceOptions
 
@@ -313,19 +310,19 @@ func New() (*Config, error) {
 func GetConflictFreeLabels(labels []string) ([]string, error) {
 	labelMap := map[string]string{}
 	for _, label := range labels {
-		stringSlice := strings.SplitN(label, "=", 2)
-		if len(stringSlice) > 1 {
+		key, val, ok := strings.Cut(label, "=")
+		if ok {
 			// If there is a conflict we will return an error
-			if v, ok := labelMap[stringSlice[0]]; ok && v != stringSlice[1] {
-				return nil, fmt.Errorf("conflict labels for %s=%s and %s=%s", stringSlice[0], stringSlice[1], stringSlice[0], v)
+			if v, ok := labelMap[key]; ok && v != val {
+				return nil, errors.Errorf("conflict labels for %s=%s and %s=%s", key, val, key, v)
 			}
-			labelMap[stringSlice[0]] = stringSlice[1]
+			labelMap[key] = val
 		}
 	}
 
 	newLabels := []string{}
 	for k, v := range labelMap {
-		newLabels = append(newLabels, fmt.Sprintf("%s=%s", k, v))
+		newLabels = append(newLabels, k+"="+v)
 	}
 	return newLabels, nil
 }
@@ -417,12 +414,41 @@ func getConflictFreeConfiguration(configFile string, flags *pflag.FlagSet) (*Con
 		return nil, err
 	}
 
-	var config Config
-
+	// Decode the contents of the JSON file using a [byte order mark] if present, instead of assuming UTF-8 without BOM.
+	// The BOM, if present, will be used to determine the encoding. If no BOM is present, we will assume the default
+	// and preferred encoding for JSON as defined by [RFC 8259], UTF-8 without BOM.
+	//
+	// While JSON is normatively UTF-8 with no BOM, there are a couple of reasons to decode here:
+	//   * UTF-8 with BOM is something that new implementations should avoid producing; however, [RFC 8259 Section 8.1]
+	//     allows implementations to ignore the UTF-8 BOM when present for interoperability. Older versions of Notepad,
+	//     the only text editor available out of the box on Windows Server, writes UTF-8 with a BOM by default.
+	//   * The default encoding for [Windows PowerShell] is UTF-16 LE with BOM. While encodings in PowerShell can be a
+	//     bit idiosyncratic, BOMs are still generally written. There is no support for selecting UTF-8 without a BOM as
+	//     the encoding in Windows PowerShell, though some Cmdlets only write UTF-8 with no BOM. PowerShell Core
+	//     introduces `utf8NoBOM` and makes it the default, but PowerShell Core is unlikely to be the implementation for
+	//     a majority of Windows Server + PowerShell users.
+	//   * While [RFC 8259 Section 8.1] asserts that software that is not part of a closed ecosystem or that crosses a
+	//     network boundary should only support UTF-8, and should never write a BOM, it does acknowledge older versions
+	//     of the standard, such as [RFC 7159 Section 8.1]. In the interest of pragmatism and easing pain for Windows
+	//     users, we consider Windows tools such as Windows PowerShell and Notepad part of our ecosystem, and support
+	//     the two most common encodings: UTF-16 LE with BOM, and UTF-8 with BOM, in addition to the standard UTF-8
+	//     without BOM.
+	//
+	// [byte order mark]: https://www.unicode.org/faq/utf_bom.html#BOM
+	// [RFC 8259]: https://www.rfc-editor.org/rfc/rfc8259
+	// [RFC 8259 Section 8.1]: https://www.rfc-editor.org/rfc/rfc8259#section-8.1
+	// [RFC 7159 Section 8.1]: https://www.rfc-editor.org/rfc/rfc7159#section-8.1
+	// [Windows PowerShell]: https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_character_encoding?view=powershell-5.1
+	b, n, err := transform.Bytes(transform.Chain(unicode.BOMOverride(transform.Nop), encoding.UTF8Validator), b)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to decode configuration JSON at offset %d", n)
+	}
+	// Trim whitespace so that an empty config can be detected for an early return.
 	b = bytes.TrimSpace(b)
+
+	var config Config
 	if len(b) == 0 {
-		// empty config file
-		return &config, nil
+		return &config, nil // early return on empty config
 	}
 
 	if flags != nil {
@@ -521,7 +547,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 		for key := range unknownKeys {
 			unknown = append(unknown, key)
 		}
-		return fmt.Errorf("the following directives don't match any configuration option: %s", strings.Join(unknown, ", "))
+		return errors.Errorf("the following directives don't match any configuration option: %s", strings.Join(unknown, ", "))
 	}
 
 	var conflicts []string
@@ -555,7 +581,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 	flags.Visit(duplicatedConflicts)
 
 	if len(conflicts) > 0 {
-		return fmt.Errorf("the following directives are specified both as a flag and in the configuration file: %s", strings.Join(conflicts, ", "))
+		return errors.Errorf("the following directives are specified both as a flag and in the configuration file: %s", strings.Join(conflicts, ", "))
 	}
 	return nil
 }
@@ -564,15 +590,10 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 // such as config.DNS, config.Labels, config.DNSSearch,
 // as well as config.MaxConcurrentDownloads, config.MaxConcurrentUploads and config.MaxDownloadAttempts.
 func Validate(config *Config) error {
-	//nolint:staticcheck // TODO(thaJeztah): remove in next release.
-	if config.RootDeprecated != "" {
-		return errors.New(`the "graph" config file option is deprecated; use "data-root" instead`)
-	}
-
 	// validate log-level
 	if config.LogLevel != "" {
 		if _, err := logrus.ParseLevel(config.LogLevel); err != nil {
-			return fmt.Errorf("invalid logging level: %s", config.LogLevel)
+			return errors.Errorf("invalid logging level: %s", config.LogLevel)
 		}
 	}
 
@@ -599,22 +620,22 @@ func Validate(config *Config) error {
 
 	// TODO(thaJeztah) Validations below should not accept "0" to be valid; see Validate() for a more in-depth description of this problem
 	if config.Mtu < 0 {
-		return fmt.Errorf("invalid default MTU: %d", config.Mtu)
+		return errors.Errorf("invalid default MTU: %d", config.Mtu)
 	}
 	if config.MaxConcurrentDownloads < 0 {
-		return fmt.Errorf("invalid max concurrent downloads: %d", config.MaxConcurrentDownloads)
+		return errors.Errorf("invalid max concurrent downloads: %d", config.MaxConcurrentDownloads)
 	}
 	if config.MaxConcurrentUploads < 0 {
-		return fmt.Errorf("invalid max concurrent uploads: %d", config.MaxConcurrentUploads)
+		return errors.Errorf("invalid max concurrent uploads: %d", config.MaxConcurrentUploads)
 	}
 	if config.MaxDownloadAttempts < 0 {
-		return fmt.Errorf("invalid max download attempts: %d", config.MaxDownloadAttempts)
+		return errors.Errorf("invalid max download attempts: %d", config.MaxDownloadAttempts)
 	}
 
 	// validate that "default" runtime is not reset
 	if runtimes := config.GetAllRuntimes(); len(runtimes) > 0 {
 		if _, ok := runtimes[StockRuntimeName]; ok {
-			return fmt.Errorf("runtime name '%s' is reserved", StockRuntimeName)
+			return errors.Errorf("runtime name '%s' is reserved", StockRuntimeName)
 		}
 	}
 
@@ -626,7 +647,7 @@ func Validate(config *Config) error {
 		if !builtinRuntimes[defaultRuntime] {
 			runtimes := config.GetAllRuntimes()
 			if _, ok := runtimes[defaultRuntime]; !ok && !IsPermissibleC8dRuntimeName(defaultRuntime) {
-				return fmt.Errorf("specified default runtime '%s' does not exist", defaultRuntime)
+				return errors.Errorf("specified default runtime '%s' does not exist", defaultRuntime)
 			}
 		}
 	}

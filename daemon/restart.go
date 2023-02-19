@@ -24,7 +24,6 @@ func (daemon *Daemon) ContainerRestart(ctx context.Context, name string, options
 		return fmt.Errorf("Cannot restart container %s: %v", name, err)
 	}
 	return nil
-
 }
 
 // containerRestart attempts to gracefully stop and then start the
@@ -62,7 +61,7 @@ func (daemon *Daemon) containerRestart(ctx context.Context, container *container
 		}
 	}
 
-	if err := daemon.containerStart(container, "", "", true); err != nil {
+	if err := daemon.containerStart(ctx, container, "", "", true); err != nil {
 		return err
 	}
 
