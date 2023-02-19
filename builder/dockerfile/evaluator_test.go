@@ -1,6 +1,7 @@
 package dockerfile // import "github.com/docker/docker/builder/dockerfile"
 
 import (
+	"context"
 	"os"
 	"runtime"
 	"testing"
@@ -86,7 +87,7 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "COPY url",
 			cmd: &instructions.CopyCommand{SourcesAndDest: instructions.SourcesAndDest{
-				SourcePaths: []string{"https://index.docker.io/robots.txt"},
+				SourcePaths: []string{"https://example.com/index.html"},
 				DestPath:    "/",
 			}},
 			expectedError: "source can't be a URL for COPY",
@@ -127,9 +128,9 @@ func TestDispatch(t *testing.T) {
 				}
 			}()
 
-			b := newBuilderWithMockBackend()
+			b := newBuilderWithMockBackend(t)
 			sb := newDispatchRequest(b, '`', buildContext, NewBuildArgs(make(map[string]*string)), newStagesBuildResults())
-			err = dispatch(sb, tc.cmd)
+			err = dispatch(context.TODO(), sb, tc.cmd)
 			assert.Check(t, is.ErrorContains(err, tc.expectedError))
 		})
 	}

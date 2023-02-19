@@ -2,8 +2,10 @@ package images // import "github.com/docker/docker/daemon/images"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
@@ -46,20 +48,36 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 	}
 
 	var (
-		beforeFilter, sinceFilter *image.Image
+		beforeFilter, sinceFilter time.Time
 		err                       error
 	)
 	err = opts.Filters.WalkValues("before", func(value string) error {
-		beforeFilter, err = i.GetImage(ctx, value, imagetypes.GetImageOpts{})
-		return err
+		img, err := i.GetImage(ctx, value, imagetypes.GetImageOpts{})
+		if err != nil {
+			return err
+		}
+		// Resolve multiple values to the oldest image,
+		// equivalent to ANDing all the values together.
+		if beforeFilter.IsZero() || beforeFilter.After(img.Created) {
+			beforeFilter = img.Created
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	err = opts.Filters.WalkValues("since", func(value string) error {
-		sinceFilter, err = i.GetImage(ctx, value, imagetypes.GetImageOpts{})
-		return err
+		img, err := i.GetImage(ctx, value, imagetypes.GetImageOpts{})
+		if err != nil {
+			return err
+		}
+		// Resolve multiple values to the newest image,
+		// equivalent to ANDing all the values together.
+		if sinceFilter.Before(img.Created) {
+			sinceFilter = img.Created
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -78,16 +96,17 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 		allContainers []*container.Container
 	)
 	for id, img := range selectedImages {
-		if beforeFilter != nil {
-			if img.Created.Equal(beforeFilter.Created) || img.Created.After(beforeFilter.Created) {
-				continue
-			}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
 
-		if sinceFilter != nil {
-			if img.Created.Equal(sinceFilter.Created) || img.Created.Before(sinceFilter.Created) {
-				continue
-			}
+		if !beforeFilter.IsZero() && !img.Created.Before(beforeFilter) {
+			continue
+		}
+		if !sinceFilter.IsZero() && !img.Created.After(sinceFilter) {
+			continue
 		}
 
 		if opts.Filters.Contains("label") {
@@ -114,7 +133,7 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 			if err != nil {
 				// The layer may have been deleted between the call to `Map()` or
 				// `Heads()` and the call to `Get()`, so we just ignore this error
-				if err == layer.ErrLayerDoesNotExist {
+				if errors.Is(err, layer.ErrLayerDoesNotExist) {
 					continue
 				}
 				return nil, err
@@ -152,7 +171,6 @@ func (i *ImageService) Images(ctx context.Context, opts types.ImageListOptions) 
 		}
 		if summary.RepoDigests == nil && summary.RepoTags == nil {
 			if opts.All || len(i.imageStore.Children(id)) == 0 {
-
 				if opts.Filters.Contains("dangling") && !danglingOnly {
 					// dangling=false case, so dangling image is not needed
 					continue

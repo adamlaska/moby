@@ -90,21 +90,15 @@ type resolver struct {
 	queryLock     sync.Mutex
 	listenAddress string
 	proxyDNS      bool
-	resolverKey   string
 	startCh       chan struct{}
 }
 
-func init() {
-	rand.Seed(time.Now().Unix())
-}
-
 // NewResolver creates a new instance of the Resolver
-func NewResolver(address string, proxyDNS bool, resolverKey string, backend DNSBackend) Resolver {
+func NewResolver(address string, proxyDNS bool, backend DNSBackend) Resolver {
 	return &resolver{
 		backend:       backend,
 		proxyDNS:      proxyDNS,
 		listenAddress: address,
-		resolverKey:   resolverKey,
 		err:           fmt.Errorf("setup not done yet"),
 		startCh:       make(chan struct{}, 1),
 	}
@@ -212,9 +206,17 @@ func setCommonFlags(msg *dns.Msg) {
 	msg.RecursionAvailable = true
 }
 
+//nolint:gosec // The RNG is not used in a security-sensitive context.
+var (
+	shuffleRNG   = rand.New(rand.NewSource(time.Now().Unix()))
+	shuffleRNGMu sync.Mutex
+)
+
 func shuffleAddr(addr []net.IP) []net.IP {
+	shuffleRNGMu.Lock()
+	defer shuffleRNGMu.Unlock()
 	for i := len(addr) - 1; i > 0; i-- {
-		r := rand.Intn(i + 1) //nolint:gosec // gosec complains about the use of rand here. It should be fine.
+		r := shuffleRNG.Intn(i + 1) //nolint:gosec // gosec complains about the use of rand here. It should be fine.
 		addr[i], addr[r] = addr[r], addr[i]
 	}
 	return addr
@@ -347,7 +349,6 @@ func (r *resolver) handleSRVQuery(query *dns.Msg) (*dns.Msg, error) {
 		resp.Extra = append(resp.Extra, rr1)
 	}
 	return resp, nil
-
 }
 
 func truncateResp(resp *dns.Msg, maxSize int, isTCP bool) {
@@ -397,7 +398,7 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 	}
 
 	if err != nil {
-		logrus.WithError(err).Errorf("[resolver] failed to handle query: %s (%s) from %s", queryName, dns.TypeToString[queryType], extConn.LocalAddr().String())
+		logrus.WithError(err).Errorf("[resolver] failed to handle query: %s (%s)", queryName, dns.TypeToString[queryType])
 		return
 	}
 
@@ -502,7 +503,7 @@ func (r *resolver) ServeDNS(w dns.ResponseWriter, query *dns.Msg) {
 			// client can retry over TCP
 			if err != nil && (resp == nil || !resp.Truncated) {
 				r.forwardQueryEnd()
-				logrus.WithError(err).Debugf("[resolver] failed to read from DNS server")
+				logrus.WithError(err).Warnf("[resolver] failed to read from DNS server: %s, query: %s", extConn.RemoteAddr().String(), query.Question[0].String())
 				continue
 			}
 			r.forwardQueryEnd()

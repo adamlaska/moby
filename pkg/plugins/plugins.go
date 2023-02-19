@@ -151,7 +151,6 @@ func (p *Plugin) runHandlers() {
 		p.handlersRun = true
 	}
 	handlers.RUnlock()
-
 }
 
 // activated returns if the plugin has already been activated.
@@ -202,7 +201,7 @@ func load(name string) (*Plugin, error) {
 }
 
 func loadWithRetry(name string, retry bool) (*Plugin, error) {
-	registry := newLocalRegistry()
+	registry := NewLocalRegistry()
 	start := time.Now()
 
 	var retries int
@@ -294,8 +293,8 @@ func Handle(iface string, fn func(string, *Client)) {
 }
 
 // GetAll returns all the plugins for the specified implementation
-func GetAll(imp string) ([]*Plugin, error) {
-	pluginNames, err := Scan()
+func (l *LocalRegistry) GetAll(imp string) ([]*Plugin, error) {
+	pluginNames, err := l.Scan()
 	if err != nil {
 		return nil, err
 	}

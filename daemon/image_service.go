@@ -35,15 +35,17 @@ type ImageService interface {
 	LogImageEvent(imageID, refName, action string)
 	LogImageEventWithAttributes(imageID, refName, action string, attributes map[string]string)
 	CountImages() int
-	ImageDiskUsage(ctx context.Context) ([]*types.ImageSummary, error)
 	ImagesPrune(ctx context.Context, pruneFilters filters.Args) (*types.ImagesPruneReport, error)
-	ImportImage(src string, repository string, platform *v1.Platform, tag string, msg string, inConfig io.ReadCloser, outStream io.Writer, changes []string) error
-	TagImage(imageName, repository, tag string) (string, error)
-	TagImageWithReference(imageID image.ID, newTag reference.Named) error
+	ImportImage(ctx context.Context, ref reference.Named, platform *v1.Platform, msg string, layerReader io.Reader, changes []string) (image.ID, error)
+	TagImage(ctx context.Context, imageID image.ID, newTag reference.Named) error
 	GetImage(ctx context.Context, refOrID string, options imagetype.GetImageOpts) (*image.Image, error)
-	ImageHistory(name string) ([]*imagetype.HistoryResponseItem, error)
-	CommitImage(c backend.CommitConfig) (image.ID, error)
+	ImageHistory(ctx context.Context, name string) ([]*imagetype.HistoryResponseItem, error)
+	CommitImage(ctx context.Context, c backend.CommitConfig) (image.ID, error)
 	SquashImage(id, parent string) (string, error)
+
+	// Containerd related methods
+
+	PrepareSnapshot(ctx context.Context, id string, image string, platform *v1.Platform) error
 
 	// Layers
 
@@ -55,6 +57,8 @@ type ImageService interface {
 	ReleaseLayer(rwlayer layer.RWLayer) error
 	LayerDiskUsage(ctx context.Context) (int64, error)
 	GetContainerLayerSize(containerID string) (int64, int64)
+	Mount(ctx context.Context, container *container.Container) error
+	Unmount(ctx context.Context, container *container.Container) error
 
 	// Windows specific
 
@@ -62,8 +66,8 @@ type ImageService interface {
 
 	// Build
 
-	MakeImageCache(sourceRefs []string) builder.ImageCache
-	CommitBuildStep(c backend.CommitConfig) (image.ID, error)
+	MakeImageCache(ctx context.Context, cacheFrom []string) (builder.ImageCache, error)
+	CommitBuildStep(ctx context.Context, c backend.CommitConfig) (image.ID, error)
 
 	// Other
 
