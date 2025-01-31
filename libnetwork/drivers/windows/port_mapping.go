@@ -1,30 +1,21 @@
 //go:build windows
-// +build windows
 
 package windows
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/portmapper"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/ishidawataru/sctp"
-	"github.com/sirupsen/logrus"
 )
 
-const (
-	maxAllocatePortAttempts = 10
-)
-
-// ErrUnsupportedAddressType is returned when the specified address type is not supported.
-type ErrUnsupportedAddressType string
-
-func (uat ErrUnsupportedAddressType) Error() string {
-	return fmt.Sprintf("unsupported address type: %s", string(uat))
-}
+const maxAllocatePortAttempts = 10
 
 // AllocatePorts allocates ports specified in bindings from the portMapper
 func AllocatePorts(portMapper *portmapper.PortMapper, bindings []types.PortBinding, containerIP net.IP) ([]types.PortBinding, error) {
@@ -34,7 +25,7 @@ func AllocatePorts(portMapper *portmapper.PortMapper, bindings []types.PortBindi
 		if err := allocatePort(portMapper, &b, containerIP); err != nil {
 			// On allocation failure, release previously allocated ports. On cleanup error, just log a warning message
 			if cuErr := ReleasePorts(portMapper, bs); cuErr != nil {
-				logrus.Warnf("Upon allocation failure for %v, failed to clear previously allocated port bindings: %v", b, cuErr)
+				log.G(context.TODO()).Warnf("Upon allocation failure for %v, failed to clear previously allocated port bindings: %v", b, cuErr)
 			}
 			return nil, err
 		}
@@ -71,15 +62,15 @@ func allocatePort(portMapper *portmapper.PortMapper, bnd *types.PortBinding, con
 
 	// Try up to maxAllocatePortAttempts times to get a port that's not already allocated.
 	for i := 0; i < maxAllocatePortAttempts; i++ {
-		if host, err = portMapper.MapRange(container, bnd.HostIP, int(bnd.HostPort), int(bnd.HostPortEnd), false); err == nil {
+		if host, err = portMapper.MapRange(container, bnd.HostIP, int(bnd.HostPort), int(bnd.HostPortEnd)); err == nil {
 			break
 		}
 		// There is no point in immediately retrying to map an explicitly chosen port.
 		if bnd.HostPort != 0 {
-			logrus.Warnf("Failed to allocate and map port %d-%d: %s", bnd.HostPort, bnd.HostPortEnd, err)
+			log.G(context.TODO()).Warnf("Failed to allocate and map port %d-%d: %s", bnd.HostPort, bnd.HostPortEnd, err)
 			break
 		}
-		logrus.Warnf("Failed to allocate and map port: %s, retry: %d", err, i+1)
+		log.G(context.TODO()).Warnf("Failed to allocate and map port: %s, retry: %d", err, i+1)
 	}
 	if err != nil {
 		return err
@@ -98,9 +89,9 @@ func allocatePort(portMapper *portmapper.PortMapper, bnd *types.PortBinding, con
 		break
 	default:
 		// For completeness
-		return ErrUnsupportedAddressType(fmt.Sprintf("%T", netAddr))
+		return fmt.Errorf("unsupported address type: %T", netAddr)
 	}
-	//Windows does not support host port ranges.
+	// Windows does not support host port ranges.
 	bnd.HostPortEnd = bnd.HostPort
 	return nil
 }

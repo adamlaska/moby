@@ -2,13 +2,16 @@ package libnetwork
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
+	"github.com/docker/docker/internal/testutils/netnsutils"
+	"github.com/docker/docker/libnetwork/config"
 	"github.com/docker/docker/libnetwork/iptables"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/options"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/golden"
 )
 
 const (
@@ -17,87 +20,92 @@ const (
 )
 
 func TestUserChain(t *testing.T) {
-	iptable := iptables.GetIptable(iptables.IPv4)
-
-	nc, err := New()
-	assert.NilError(t, err)
+	iptable4 := iptables.GetIptable(iptables.IPv4)
+	iptable6 := iptables.GetIptable(iptables.IPv6)
 
 	tests := []struct {
-		iptables  bool
-		insert    bool // insert other rules to FORWARD
-		fwdChain  []string
-		userChain []string
+		iptables bool
+		append   bool // append other rules to FORWARD
 	}{
 		{
+			iptables: true,
+			append:   false,
+		},
+		{
+			iptables: true,
+			append:   true,
+		},
+		{
 			iptables: false,
-			insert:   false,
-			fwdChain: []string{"-P FORWARD ACCEPT"},
-		},
-		{
-			iptables:  true,
-			insert:    false,
-			fwdChain:  []string{"-P FORWARD ACCEPT", "-A FORWARD -j DOCKER-USER"},
-			userChain: []string{"-N DOCKER-USER", "-A DOCKER-USER -j RETURN"},
-		},
-		{
-			iptables:  true,
-			insert:    true,
-			fwdChain:  []string{"-P FORWARD ACCEPT", "-A FORWARD -j DOCKER-USER", "-A FORWARD -j DROP"},
-			userChain: []string{"-N DOCKER-USER", "-A DOCKER-USER -j RETURN"},
+			append:   false,
 		},
 	}
 
-	resetIptables(t)
 	for _, tc := range tests {
-		tc := tc
-		t.Run(fmt.Sprintf("iptables=%v,insert=%v", tc.iptables, tc.insert), func(t *testing.T) {
-			c := nc.(*controller)
-			c.cfg.Daemon.DriverCfg["bridge"] = map[string]interface{}{
-				netlabel.GenericData: options.Generic{
-					"EnableIPTables": tc.iptables,
-				},
+		t.Run(fmt.Sprintf("iptables=%v,append=%v", tc.iptables, tc.append), func(t *testing.T) {
+			defer netnsutils.SetupTestOSContext(t)()
+			defer resetIptables(t)
+
+			c, err := New(
+				config.OptionDataDir(t.TempDir()),
+				config.OptionDriverConfig("bridge", map[string]any{
+					netlabel.GenericData: options.Generic{
+						"EnableIPTables":  tc.iptables,
+						"EnableIP6Tables": tc.iptables,
+					},
+				}))
+			assert.NilError(t, err)
+			defer c.Stop()
+
+			// init. condition
+			golden.Assert(t, getRules(t, iptable4, fwdChainName),
+				fmt.Sprintf("TestUserChain_iptables-%v_append-%v_fwdinit4", tc.iptables, tc.append))
+			golden.Assert(t, getRules(t, iptable6, fwdChainName),
+				fmt.Sprintf("TestUserChain_iptables-%v_append-%v_fwdinit6", tc.iptables, tc.append))
+
+			if tc.append {
+				_, err := iptable4.Raw("-A", fwdChainName, "-j", "DROP")
+				assert.Check(t, err)
+				_, err = iptable6.Raw("-A", fwdChainName, "-j", "DROP")
+				assert.Check(t, err)
 			}
+			c.setupUserChains()
 
-			// init. condition, FORWARD chain empty DOCKER-USER not exist
-			assert.DeepEqual(t, getRules(t, fwdChainName), []string{"-P FORWARD ACCEPT"})
+			golden.Assert(t, getRules(t, iptable4, fwdChainName),
+				fmt.Sprintf("TestUserChain_iptables-%v_append-%v_fwdafter4", tc.iptables, tc.append))
+			golden.Assert(t, getRules(t, iptable6, fwdChainName),
+				fmt.Sprintf("TestUserChain_iptables-%v_append-%v_fwdafter6", tc.iptables, tc.append))
 
-			if tc.insert {
-				_, err = iptable.Raw("-A", fwdChainName, "-j", "DROP")
-				assert.NilError(t, err)
-			}
-			arrangeUserFilterRule()
-
-			assert.DeepEqual(t, getRules(t, fwdChainName), tc.fwdChain)
-			if tc.userChain != nil {
-				assert.DeepEqual(t, getRules(t, usrChainName), tc.userChain)
+			if tc.iptables {
+				golden.Assert(t, getRules(t, iptable4, usrChainName),
+					fmt.Sprintf("TestUserChain_iptables-%v_append-%v_usrafter4", tc.iptables, tc.append))
+				golden.Assert(t, getRules(t, iptable6, usrChainName),
+					fmt.Sprintf("TestUserChain_iptables-%v_append-%v_usrafter6", tc.iptables, tc.append))
 			} else {
-				_, err := iptable.Raw("-S", usrChainName)
-				assert.Assert(t, err != nil, "chain %v: created unexpectedly", usrChainName)
+				_, err := iptable4.Raw("-S", usrChainName)
+				assert.Check(t, is.ErrorContains(err, "No chain/target/match by that name"), "ipv4 chain %v: created unexpectedly", usrChainName)
+				_, err = iptable6.Raw("-S", usrChainName)
+				assert.Check(t, is.ErrorContains(err, "No chain/target/match by that name"), "ipv6 chain %v: created unexpectedly", usrChainName)
 			}
 		})
-		resetIptables(t)
 	}
 }
 
-func getRules(t *testing.T, chain string) []string {
-	iptable := iptables.GetIptable(iptables.IPv4)
-
+func getRules(t *testing.T, iptable *iptables.IPTable, chain string) string {
 	t.Helper()
 	output, err := iptable.Raw("-S", chain)
 	assert.NilError(t, err, "chain %s: failed to get rules", chain)
-
-	rules := strings.Split(string(output), "\n")
-	if len(rules) > 0 {
-		rules = rules[:len(rules)-1]
-	}
-	return rules
+	return string(output)
 }
 
 func resetIptables(t *testing.T) {
-	iptable := iptables.GetIptable(iptables.IPv4)
-
 	t.Helper()
-	_, err := iptable.Raw("-F", fwdChainName)
-	assert.NilError(t, err)
-	_ = iptable.RemoveExistingChain(usrChainName, "")
+
+	for _, ipVer := range []iptables.IPVersion{iptables.IPv4, iptables.IPv6} {
+		iptable := iptables.GetIptable(ipVer)
+
+		_, err := iptable.Raw("-F", fwdChainName)
+		assert.Check(t, err)
+		_ = iptable.RemoveExistingChain(usrChainName, iptables.Filter)
+	}
 }

@@ -7,13 +7,13 @@ import (
 	"path/filepath"
 
 	"github.com/Microsoft/hcsshim/cmd/containerd-shim-runhcs-v1/options"
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/containers"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/log"
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 func summaryFromInterface(i interface{}) (*libcontainerdtypes.Summary, error) {
@@ -43,14 +43,14 @@ func WithBundle(bundleDir string, ociSpec *specs.Spec) containerd.NewContainerOp
 			c.Labels = make(map[string]string)
 		}
 		c.Labels[DockerContainerBundlePath] = bundleDir
-		return os.MkdirAll(bundleDir, 0755)
+		return os.MkdirAll(bundleDir, 0o755)
 	}
 }
 
-func withLogLevel(level logrus.Level) containerd.NewTaskOpts {
+func withLogLevel(level log.Level) containerd.NewTaskOpts {
 	// Make sure we set the runhcs options to debug if we are at debug level.
 	return func(_ context.Context, _ *containerd.Client, info *containerd.TaskInfo) error {
-		if level == logrus.DebugLevel {
+		if level == log.DebugLevel {
 			info.Options = &options.Options{Debug: true}
 		}
 		return nil

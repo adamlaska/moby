@@ -7,12 +7,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/distribution/reference"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/schema2"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/client"
 	"github.com/docker/distribution/registry/client/auth"
-	"github.com/docker/distribution/registry/client/transport"
 	registrytypes "github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/registry"
@@ -20,6 +19,22 @@ import (
 )
 
 var (
+	// supportedMediaTypes represents acceptable media-type(-prefixes)
+	// we use this list to prevent obscure errors when trying to pull
+	// OCI artifacts.
+	supportedMediaTypes = []string{
+		// valid prefixes
+		"application/vnd.oci.image",
+		"application/vnd.docker",
+
+		// these types may occur on old images, and are copied from
+		// defaultImageTypes below.
+		"application/octet-stream",
+		"application/json",
+		"text/html",
+		"",
+	}
+
 	// defaultImageTypes represents the schema2 config types for images
 	defaultImageTypes = []string{
 		schema2.MediaTypeImageConfig,
@@ -59,12 +74,9 @@ func init() {
 func newRepository(
 	ctx context.Context, repoInfo *registry.RepositoryInfo, endpoint registry.APIEndpoint,
 	metaHeaders http.Header, authConfig *registrytypes.AuthConfig, actions ...string,
-) (repo distribution.Repository, err error) {
-	repoName := repoInfo.Name.Name()
-	// If endpoint does not support CanonicalName, use the RemoteName instead
-	if endpoint.TrimHostname {
-		repoName = reference.Path(repoInfo.Name)
-	}
+) (distribution.Repository, error) {
+	// Trim the hostname to form the RemoteName
+	repoName := reference.Path(repoInfo.Name)
 
 	direct := &net.Dialer{
 		Timeout:   30 * time.Second,
@@ -82,7 +94,7 @@ func newRepository(
 	}
 
 	modifiers := registry.Headers(dockerversion.DockerUserAgent(ctx), metaHeaders)
-	authTransport := transport.NewTransport(base, modifiers...)
+	authTransport := newTransport(base, modifiers...)
 
 	challengeManager, err := registry.PingV2Registry(endpoint.URL, authTransport)
 	if err != nil {
@@ -98,28 +110,25 @@ func newRepository(
 	}
 
 	if authConfig.RegistryToken != "" {
-		passThruTokenHandler := &existingTokenHandler{token: authConfig.RegistryToken}
-		modifiers = append(modifiers, auth.NewAuthorizer(challengeManager, passThruTokenHandler))
+		modifiers = append(modifiers, auth.NewAuthorizer(challengeManager, &passThruTokenHandler{token: authConfig.RegistryToken}))
 	} else {
-		scope := auth.RepositoryScope{
-			Repository: repoName,
-			Actions:    actions,
-			Class:      repoInfo.Class,
-		}
-
 		creds := registry.NewStaticCredentialStore(authConfig)
-		tokenHandlerOptions := auth.TokenHandlerOptions{
+		tokenHandler := auth.NewTokenHandlerWithOptions(auth.TokenHandlerOptions{
 			Transport:   authTransport,
 			Credentials: creds,
-			Scopes:      []auth.Scope{scope},
-			ClientID:    registry.AuthClientID,
-		}
-		tokenHandler := auth.NewTokenHandlerWithOptions(tokenHandlerOptions)
+			Scopes: []auth.Scope{auth.RepositoryScope{
+				Repository: repoName,
+				Actions:    actions,
+			}},
+			ClientID: registry.AuthClientID,
+		})
 		basicHandler := auth.NewBasicHandler(creds)
 		modifiers = append(modifiers, auth.NewAuthorizer(challengeManager, tokenHandler, basicHandler))
 	}
-	tr := transport.NewTransport(base, modifiers...)
 
+	tr := newTransport(base, modifiers...)
+
+	// FIXME(thaJeztah): should this just take the original repoInfo.Name instead of converting the remote name back to a named reference?
 	repoNameRef, err := reference.WithName(repoName)
 	if err != nil {
 		return nil, fallbackError{
@@ -128,25 +137,26 @@ func newRepository(
 		}
 	}
 
-	repo, err = client.NewRepository(repoNameRef, endpoint.URL.String(), tr)
+	repo, err := client.NewRepository(repoNameRef, endpoint.URL.String(), tr)
 	if err != nil {
-		err = fallbackError{
+		return nil, fallbackError{
 			err:         err,
 			transportOK: true,
 		}
 	}
-	return
+
+	return repo, nil
 }
 
-type existingTokenHandler struct {
+type passThruTokenHandler struct {
 	token string
 }
 
-func (th *existingTokenHandler) Scheme() string {
+func (th *passThruTokenHandler) Scheme() string {
 	return "bearer"
 }
 
-func (th *existingTokenHandler) AuthorizeRequest(req *http.Request, params map[string]string) error {
+func (th *passThruTokenHandler) AuthorizeRequest(req *http.Request, params map[string]string) error {
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", th.token))
 	return nil
 }

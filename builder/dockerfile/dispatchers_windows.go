@@ -6,15 +6,15 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/internal/lazyregexp"
 	"github.com/docker/docker/pkg/system"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 )
 
-var pattern = regexp.MustCompile(`^[a-zA-Z]:\.$`)
+var pattern = lazyregexp.New(`^[a-zA-Z]:\.$`)
 
 // normalizeWorkdir normalizes a user requested working directory in a
 // platform semantically consistent way.
@@ -108,7 +108,6 @@ func normalizeWorkdirWindows(current string, requested string) (string, error) {
 //
 // The commands when this function is called are RUN, ENTRYPOINT and CMD.
 func resolveCmdLine(cmd instructions.ShellDependantCmdLine, runConfig *container.Config, os, command, original string) ([]string, bool) {
-
 	// Make sure we return an empty array if there is no cmd.CmdLine
 	if len(cmd.CmdLine) == 0 {
 		return []string{}, runConfig.ArgsEscaped

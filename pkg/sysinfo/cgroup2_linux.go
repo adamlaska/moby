@@ -1,14 +1,15 @@
 package sysinfo // import "github.com/docker/docker/pkg/sysinfo"
 
 import (
+	"context"
 	"os"
 	"path"
 	"strings"
 
-	"github.com/containerd/cgroups"
-	cgroupsV2 "github.com/containerd/cgroups/v2"
-	"github.com/containerd/containerd/pkg/userns"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/cgroups/v3"
+	cgroupsV2 "github.com/containerd/cgroups/v3/cgroup2"
+	"github.com/containerd/log"
+	"github.com/moby/sys/userns"
 )
 
 func newV2(options ...Opt) *SysInfo {
@@ -27,14 +28,14 @@ func newV2(options ...Opt) *SysInfo {
 		applyCgroupNsInfo,
 	}
 
-	m, err := cgroupsV2.LoadManager("/sys/fs/cgroup", sysInfo.cg2GroupPath)
+	m, err := cgroupsV2.Load(sysInfo.cg2GroupPath)
 	if err != nil {
-		logrus.Warn(err)
+		log.G(context.TODO()).Warn(err)
 	} else {
 		sysInfo.cg2Controllers = make(map[string]struct{})
 		controllers, err := m.Controllers()
 		if err != nil {
-			logrus.Warn(err)
+			log.G(context.TODO()).Warn(err)
 		}
 		for _, c := range controllers {
 			sysInfo.cg2Controllers[c] = struct{}{}
@@ -124,11 +125,25 @@ func applyCPUSetCgroupInfoV2(info *SysInfo) {
 	}
 	info.Cpus = strings.TrimSpace(string(cpus))
 
+	cpuSets, err := parseUintList(info.Cpus, 0)
+	if err != nil {
+		info.Warnings = append(info.Warnings, "Unable to parse cpuset cpus: "+err.Error())
+		return
+	}
+	info.CPUSets = cpuSets
+
 	mems, err := os.ReadFile(path.Join("/sys/fs/cgroup", info.cg2GroupPath, "cpuset.mems.effective"))
 	if err != nil {
 		return
 	}
 	info.Mems = strings.TrimSpace(string(mems))
+
+	memSets, err := parseUintList(info.Cpus, 0)
+	if err != nil {
+		info.Warnings = append(info.Warnings, "Unable to parse cpuset mems: "+err.Error())
+		return
+	}
+	info.MemSets = memSets
 }
 
 func applyPIDSCgroupInfoV2(info *SysInfo) {

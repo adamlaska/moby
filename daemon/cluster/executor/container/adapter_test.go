@@ -1,9 +1,8 @@
 package container // import "github.com/docker/docker/daemon/cluster/executor/container"
 
 import (
-	"testing"
-
 	"context"
+	"testing"
 	"time"
 
 	"github.com/docker/docker/daemon"
@@ -20,7 +19,7 @@ func TestWaitNodeAttachment(t *testing.T) {
 	// and add some attachments to it
 	attachmentStore := emptyDaemon.GetAttachmentStore()
 
-	// create a set of attachments to put into the attahcment store
+	// create a set of attachments to put into the attachment store
 	attachments := map[string]string{
 		"network1": "10.1.2.3/24",
 	}
@@ -35,35 +34,29 @@ func TestWaitNodeAttachment(t *testing.T) {
 	// actually; only the networkAttachments are needed.
 	container := &containerConfig{
 		task: nil,
-		networksAttachments: map[string]*api.NetworkAttachment{
+		networks: map[string]*api.Network{
 			// network1 is already present in the attachment store.
 			"network1": {
-				Network: &api.Network{
-					ID: "network1",
-					DriverState: &api.Driver{
-						Name: "overlay",
-					},
+				ID: "network1",
+				DriverState: &api.Driver{
+					Name: "overlay",
 				},
 			},
 			// network2 is not yet present in the attachment store, and we
 			// should block while waiting for it.
 			"network2": {
-				Network: &api.Network{
-					ID: "network2",
-					DriverState: &api.Driver{
-						Name: "overlay",
-					},
+				ID: "network2",
+				DriverState: &api.Driver{
+					Name: "overlay",
 				},
 			},
 			// localnetwork is not and will never be in the attachment store,
 			// but we should not block on it, because it is not an overlay
 			// network
 			"localnetwork": {
-				Network: &api.Network{
-					ID: "localnetwork",
-					DriverState: &api.Driver{
-						Name: "bridge",
-					},
+				ID: "localnetwork",
+				DriverState: &api.Driver{
+					Name: "bridge",
 				},
 			},
 		},

@@ -5,17 +5,19 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/docker/distribution/reference"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/internal/metrics"
 	"github.com/docker/docker/layer"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // ImageHistory returns a slice of ImageHistory structures for the specified image
 // name by walking the image lineage.
-func (i *ImageService) ImageHistory(name string) ([]*image.HistoryResponseItem, error) {
-	ctx := context.TODO()
+func (i *ImageService) ImageHistory(ctx context.Context, name string, platform *ocispec.Platform) ([]*image.HistoryResponseItem, error) {
 	start := time.Now()
-	img, err := i.GetImage(ctx, name, image.GetImageOpts{})
+	img, err := i.GetImage(ctx, name, backend.GetImageOpts{Platform: platform})
 	if err != nil {
 		return nil, err
 	}
@@ -43,9 +45,14 @@ func (i *ImageService) ImageHistory(name string) ([]*image.HistoryResponseItem, 
 			layerCounter++
 		}
 
+		var created int64
+		if h.Created != nil {
+			created = h.Created.Unix()
+		}
+
 		history = append([]*image.HistoryResponseItem{{
 			ID:        "<missing>",
-			Created:   h.Created.Unix(),
+			Created:   created,
 			CreatedBy: h.CreatedBy,
 			Comment:   h.Comment,
 			Size:      layerSize,
@@ -71,11 +78,11 @@ func (i *ImageService) ImageHistory(name string) ([]*image.HistoryResponseItem, 
 		if id == "" {
 			break
 		}
-		histImg, err = i.GetImage(ctx, id.String(), image.GetImageOpts{})
+		histImg, err = i.GetImage(ctx, id.String(), backend.GetImageOpts{})
 		if err != nil {
 			break
 		}
 	}
-	imageActions.WithValues("history").UpdateSince(start)
+	metrics.ImageActions.WithValues("history").UpdateSince(start)
 	return history, nil
 }

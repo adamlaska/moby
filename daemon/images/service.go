@@ -4,23 +4,20 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync/atomic"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/leases"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/filters"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/docker/docker/container"
 	daemonevents "github.com/docker/docker/daemon/events"
+	"github.com/docker/docker/distribution"
 	"github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	dockerreference "github.com/docker/docker/reference"
-	"github.com/docker/docker/registry"
-	"github.com/docker/libtrust"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"golang.org/x/sync/singleflight"
 )
 
 type containerStore interface {
@@ -44,8 +41,7 @@ type ImageServiceConfig struct {
 	MaxConcurrentUploads      int
 	MaxDownloadAttempts       int
 	ReferenceStore            dockerreference.Store
-	RegistryService           registry.Service
-	TrustKey                  libtrust.PrivateKey
+	RegistryService           distribution.RegistryResolver
 	ContentStore              content.Store
 	Leases                    leases.Manager
 	ContentNamespace          string
@@ -62,7 +58,6 @@ func NewImageService(config ImageServiceConfig) *ImageService {
 		layerStore:                config.LayerStore,
 		referenceStore:            config.ReferenceStore,
 		registryService:           config.RegistryService,
-		trustKey:                  config.TrustKey,
 		uploadManager:             xfer.NewLayerUploadManager(config.MaxConcurrentUploads),
 		leases:                    config.Leases,
 		content:                   config.ContentStore,
@@ -78,15 +73,13 @@ type ImageService struct {
 	eventsService             *daemonevents.Events
 	imageStore                image.Store
 	layerStore                layer.Store
-	pruneRunning              int32
+	pruneRunning              atomic.Bool
 	referenceStore            dockerreference.Store
-	registryService           registry.Service
-	trustKey                  libtrust.PrivateKey
+	registryService           distribution.RegistryResolver
 	uploadManager             *xfer.LayerUploadManager
 	leases                    leases.Manager
 	content                   content.Store
 	contentNamespace          string
-	usage                     singleflight.Group
 }
 
 // DistributionServices provides daemon image storage services
@@ -111,21 +104,21 @@ func (i *ImageService) DistributionServices() DistributionServices {
 
 // CountImages returns the number of images stored by ImageService
 // called from info.go
-func (i *ImageService) CountImages() int {
+func (i *ImageService) CountImages(ctx context.Context) int {
 	return i.imageStore.Len()
 }
 
 // Children returns the children image.IDs for a parent image.
 // called from list.go to filter containers
 // TODO: refactor to expose an ancestry for image.ID?
-func (i *ImageService) Children(id image.ID) []image.ID {
-	return i.imageStore.Children(id)
+func (i *ImageService) Children(_ context.Context, id image.ID) ([]image.ID, error) {
+	return i.imageStore.Children(id), nil
 }
 
 // CreateLayer creates a filesystem layer for a container.
 // called from create.go
 // TODO: accept an opt struct instead of container?
-func (i *ImageService) CreateLayer(container *container.Container, initFunc layer.MountInit) (layer.RWLayer, error) {
+func (i *ImageService) CreateLayer(container *container.Container, initFunc layer.MountInit) (container.RWLayer, error) {
 	var layerID layer.ChainID
 	if container.ImageID != "" {
 		img, err := i.imageStore.Get(container.ImageID)
@@ -145,8 +138,8 @@ func (i *ImageService) CreateLayer(container *container.Container, initFunc laye
 }
 
 // GetLayerByID returns a layer by ID
-// called from daemon.go Daemon.restore(), and Daemon.containerExport().
-func (i *ImageService) GetLayerByID(cid string) (layer.RWLayer, error) {
+// called from daemon.go Daemon.restore().
+func (i *ImageService) GetLayerByID(cid string) (container.RWLayer, error) {
 	return i.layerStore.GetRWLayer(cid)
 }
 
@@ -157,7 +150,7 @@ func (i *ImageService) LayerStoreStatus() [][2]string {
 }
 
 // GetLayerMountID returns the mount ID for a layer
-// called from daemon.go Daemon.Shutdown(), and Daemon.Cleanup() (cleanup is actually continerCleanup)
+// called from daemon.go Daemon.Shutdown(), and Daemon.Cleanup() (cleanup is actually containerCleanup)
 // TODO: needs to be refactored to Unmount (see callers), or removed and replaced with GetLayerByID
 func (i *ImageService) GetLayerMountID(cid string) (string, error) {
 	return i.layerStore.GetMountID(cid)
@@ -178,9 +171,14 @@ func (i *ImageService) StorageDriver() string {
 }
 
 // ReleaseLayer releases a layer allowing it to be removed
-// called from delete.go Daemon.cleanupContainer(), and Daemon.containerExport()
-func (i *ImageService) ReleaseLayer(rwlayer layer.RWLayer) error {
-	metaData, err := i.layerStore.ReleaseRWLayer(rwlayer)
+// called from delete.go Daemon.cleanupContainer().
+func (i *ImageService) ReleaseLayer(rwlayer container.RWLayer) error {
+	l, ok := rwlayer.(layer.RWLayer)
+	if !ok {
+		return fmt.Errorf("unexpected RWLayer type: %T", rwlayer)
+	}
+
+	metaData, err := i.layerStore.ReleaseRWLayer(l)
 	layer.LogReleaseMetadata(metaData)
 	if err != nil && !errors.Is(err, layer.ErrMountDoesNotExist) && !errors.Is(err, os.ErrNotExist) {
 		return errors.Wrapf(err, "driver %q failed to remove root filesystem",
@@ -192,32 +190,21 @@ func (i *ImageService) ReleaseLayer(rwlayer layer.RWLayer) error {
 // LayerDiskUsage returns the number of bytes used by layer stores
 // called from disk_usage.go
 func (i *ImageService) LayerDiskUsage(ctx context.Context) (int64, error) {
-	ch := i.usage.DoChan("LayerDiskUsage", func() (interface{}, error) {
-		var allLayersSize int64
-		layerRefs := i.getLayerRefs()
-		allLayers := i.layerStore.Map()
-		for _, l := range allLayers {
-			select {
-			case <-ctx.Done():
-				return allLayersSize, ctx.Err()
-			default:
-				size := l.DiffSize()
-				if _, ok := layerRefs[l.ChainID()]; ok {
-					allLayersSize += size
-				}
+	var allLayersSize int64
+	layerRefs := i.getLayerRefs()
+	allLayers := i.layerStore.Map()
+	for _, l := range allLayers {
+		select {
+		case <-ctx.Done():
+			return allLayersSize, ctx.Err()
+		default:
+			size := l.DiffSize()
+			if _, ok := layerRefs[l.ChainID()]; ok {
+				allLayersSize += size
 			}
 		}
-		return allLayersSize, nil
-	})
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	case res := <-ch:
-		if res.Err != nil {
-			return 0, res.Err
-		}
-		return res.Val.(int64), nil
 	}
+	return allLayersSize, nil
 }
 
 func (i *ImageService) getLayerRefs() map[layer.ChainID]int {
@@ -239,31 +226,6 @@ func (i *ImageService) getLayerRefs() map[layer.ChainID]int {
 	}
 
 	return layerRefs
-}
-
-// ImageDiskUsage returns information about image data disk usage.
-func (i *ImageService) ImageDiskUsage(ctx context.Context) ([]*types.ImageSummary, error) {
-	ch := i.usage.DoChan("ImageDiskUsage", func() (interface{}, error) {
-		// Get all top images with extra attributes
-		images, err := i.Images(ctx, types.ImageListOptions{
-			Filters:        filters.NewArgs(),
-			SharedSize:     true,
-			ContainerCount: true,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve image list: %v", err)
-		}
-		return images, nil
-	})
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		return res.Val.([]*types.ImageSummary), nil
-	}
 }
 
 // UpdateConfig values

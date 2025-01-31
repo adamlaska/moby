@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/containerd/containerd/leases"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/log"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -126,7 +126,7 @@ func (l *sLM) delRef(lID, sID string) {
 		if len(leases) == 0 {
 			delete(l.bySnapshot, sID)
 			if err := l.s.remove(context.TODO(), sID); err != nil {
-				logrus.Warnf("failed to remove snapshot %v", sID)
+				log.G(context.TODO()).Warnf("failed to remove snapshot %v", sID)
 			}
 		}
 	}

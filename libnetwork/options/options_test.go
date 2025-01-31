@@ -1,16 +1,18 @@
 package options
 
 import (
-	"reflect"
-	"strings"
 	"testing"
+
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestGenerate(t *testing.T) {
-	gen := NewGeneric()
-	gen["Int"] = 1
-	gen["Rune"] = 'b'
-	gen["Float64"] = 2.0
+	gen := Generic{
+		"Int":     1,
+		"Rune":    'b',
+		"Float64": 2.0,
+	}
 
 	type Model struct {
 		Int     int
@@ -18,32 +20,22 @@ func TestGenerate(t *testing.T) {
 		Float64 float64
 	}
 
+	expected := Model{
+		Int:     1,
+		Rune:    'b',
+		Float64: 2.0,
+	}
 	result, err := GenerateFromModel(gen, Model{})
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cast, ok := result.(Model)
-	if !ok {
-		t.Fatalf("result has unexpected type %s", reflect.TypeOf(result))
-	}
-	if expected := 1; cast.Int != expected {
-		t.Fatalf("wrong value for field Int: expected %v, got %v", expected, cast.Int)
-	}
-	if expected := 'b'; cast.Rune != expected {
-		t.Fatalf("wrong value for field Rune: expected %v, got %v", expected, cast.Rune)
-	}
-	if expected := 2.0; cast.Float64 != expected {
-		t.Fatalf("wrong value for field Int: expected %v, got %v", expected, cast.Float64)
-	}
+	assert.Check(t, err)
+	assert.Check(t, is.DeepEqual(result, expected))
 }
 
 func TestGeneratePtr(t *testing.T) {
-	gen := NewGeneric()
-	gen["Int"] = 1
-	gen["Rune"] = 'b'
-	gen["Float64"] = 2.0
+	gen := Generic{
+		"Int":     1,
+		"Rune":    'b',
+		"Float64": 2.0,
+	}
 
 	type Model struct {
 		Int     int
@@ -51,56 +43,44 @@ func TestGeneratePtr(t *testing.T) {
 		Float64 float64
 	}
 
+	expected := &Model{
+		Int:     1,
+		Rune:    'b',
+		Float64: 2.0,
+	}
+
 	result, err := GenerateFromModel(gen, &Model{})
-
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cast, ok := result.(*Model)
-	if !ok {
-		t.Fatalf("result has unexpected type %s", reflect.TypeOf(result))
-	}
-	if expected := 1; cast.Int != expected {
-		t.Fatalf("wrong value for field Int: expected %v, got %v", expected, cast.Int)
-	}
-	if expected := 'b'; cast.Rune != expected {
-		t.Fatalf("wrong value for field Rune: expected %v, got %v", expected, cast.Rune)
-	}
-	if expected := 2.0; cast.Float64 != expected {
-		t.Fatalf("wrong value for field Int: expected %v, got %v", expected, cast.Float64)
-	}
+	assert.NilError(t, err)
+	assert.Check(t, is.DeepEqual(result, expected))
 }
 
 func TestGenerateMissingField(t *testing.T) {
 	type Model struct{}
-	_, err := GenerateFromModel(Generic{"foo": "bar"}, Model{})
-
-	if _, ok := err.(NoSuchFieldError); !ok {
-		t.Fatalf("expected NoSuchFieldError, got %#v", err)
-	} else if expected := "no field"; !strings.Contains(err.Error(), expected) {
-		t.Fatalf("expected %q in error message, got %s", expected, err.Error())
-	}
+	gen := Generic{"foo": "bar"}
+	_, err := GenerateFromModel(gen, Model{})
+	const expected = `no field "foo" in type "options.Model"`
+	assert.Check(t, is.Error(err, expected))
+	assert.Check(t, is.ErrorType(err, NoSuchFieldError{}))
 }
 
 func TestFieldCannotBeSet(t *testing.T) {
-	type Model struct{ foo int } //nolint:structcheck
-	_, err := GenerateFromModel(Generic{"foo": "bar"}, Model{})
-
-	if _, ok := err.(CannotSetFieldError); !ok {
-		t.Fatalf("expected CannotSetFieldError, got %#v", err)
-	} else if expected := "cannot set field"; !strings.Contains(err.Error(), expected) {
-		t.Fatalf("expected %q in error message, got %s", expected, err.Error())
+	type Model struct {
+		foo int //nolint:nolintlint,unused // un-exported field is used to test error-handling
 	}
+	gen := Generic{"foo": "bar"}
+	_, err := GenerateFromModel(gen, Model{})
+	const expected = `cannot set field "foo" of type "options.Model"`
+	assert.Check(t, is.Error(err, expected))
+	assert.Check(t, is.ErrorType(err, CannotSetFieldError{}))
 }
 
 func TestTypeMismatchError(t *testing.T) {
-	type Model struct{ Foo int }
-	_, err := GenerateFromModel(Generic{"Foo": "bar"}, Model{})
-
-	if _, ok := err.(TypeMismatchError); !ok {
-		t.Fatalf("expected TypeMismatchError, got %#v", err)
-	} else if expected := "type mismatch"; !strings.Contains(err.Error(), expected) {
-		t.Fatalf("expected %q in error message, got %s", expected, err.Error())
+	type Model struct {
+		Foo int
 	}
+	gen := Generic{"Foo": "bar"}
+	_, err := GenerateFromModel(gen, Model{})
+	const expected = `type mismatch, field Foo require type int, actual type string`
+	assert.Check(t, is.Error(err, expected))
+	assert.Check(t, is.ErrorType(err, TypeMismatchError{}))
 }

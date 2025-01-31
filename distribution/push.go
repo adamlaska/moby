@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/docker/distribution/reference"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/progress"
-	"github.com/sirupsen/logrus"
 )
 
 const compressionBufSize = 32768
@@ -49,12 +51,12 @@ func Push(ctx context.Context, ref reference.Named, config *ImagePushConfig) err
 	for _, endpoint := range endpoints {
 		if endpoint.URL.Scheme != "https" {
 			if _, confirmedTLS := confirmedTLSRegistries[endpoint.URL.Host]; confirmedTLS {
-				logrus.Debugf("Skipping non-TLS endpoint %s for host/port that appears to use TLS", endpoint.URL)
+				log.G(ctx).Debugf("Skipping non-TLS endpoint %s for host/port that appears to use TLS", endpoint.URL)
 				continue
 			}
 		}
 
-		logrus.Debugf("Trying to push %s to %s", repoInfo.Name.Name(), endpoint.URL)
+		log.G(ctx).Debugf("Trying to push %s to %s", repoInfo.Name.Name(), endpoint.URL)
 
 		if err := newPusher(ref, endpoint, repoInfo, config).push(ctx); err != nil {
 			// Was this push cancelled? If so, don't try to fall
@@ -68,16 +70,21 @@ func Push(ctx context.Context, ref reference.Named, config *ImagePushConfig) err
 					}
 					err = fallbackErr.err
 					lastErr = err
-					logrus.Infof("Attempting next endpoint for push after error: %v", err)
+					log.G(ctx).Infof("Attempting next endpoint for push after error: %v", err)
 					continue
 				}
 			}
 
-			logrus.Errorf("Not continuing with push after error: %v", err)
+			// FIXME(thaJeztah): cleanup error and context handling in this package, as it's really messy.
+			if errdefs.IsContext(err) {
+				log.G(ctx).WithError(err).Info("Not continuing with push after error")
+			} else {
+				log.G(ctx).WithError(err).Error("Not continuing with push after error")
+			}
 			return err
 		}
 
-		config.ImageEventLogger(reference.FamiliarString(ref), reference.FamiliarName(repoInfo.Name), "push")
+		config.ImageEventLogger(ctx, reference.FamiliarString(ref), reference.FamiliarName(repoInfo.Name), events.ActionPush)
 		return nil
 	}
 

@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types/mount"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestLinuxParseMountRaw(t *testing.T) {
@@ -82,42 +84,164 @@ func TestLinuxParseMountRaw(t *testing.T) {
 
 	for _, path := range valid {
 		if _, err := parser.ParseMountRaw(path, "local"); err != nil {
-			t.Errorf("ParseMountRaw(`%q`) should succeed: error %q", path, err)
+			t.Errorf("ParseMountRaw(%q) should succeed: error %q", path, err)
 		}
 	}
 
 	for path, expectedError := range invalid {
 		if mp, err := parser.ParseMountRaw(path, "local"); err == nil {
-			t.Errorf("ParseMountRaw(`%q`) should have failed validation. Err '%v' - MP: %v", path, err, mp)
+			t.Errorf("ParseMountRaw(%q) should have failed validation. Err '%v' - MP: %v", path, err, mp)
 		} else {
 			if !strings.Contains(err.Error(), expectedError) {
-				t.Errorf("ParseMountRaw(`%q`) error should contain %q, got %v", path, expectedError, err.Error())
+				t.Errorf("ParseMountRaw(%q) error should contain %q, got %v", path, expectedError, err.Error())
 			}
 		}
 	}
 }
 
 func TestLinuxParseMountRawSplit(t *testing.T) {
-	cases := []struct {
-		bind      string
-		driver    string
-		expType   mount.Type
-		expDest   string
-		expSource string
-		expName   string
-		expDriver string
-		expRW     bool
-		fail      bool
+	tests := []struct {
+		bind     string
+		driver   string
+		expected *MountPoint
+		expErr   string
 	}{
-		{"/tmp:/tmp1", "", mount.TypeBind, "/tmp1", "/tmp", "", "", true, false},
-		{"/tmp:/tmp2:ro", "", mount.TypeBind, "/tmp2", "/tmp", "", "", false, false},
-		{"/tmp:/tmp3:rw", "", mount.TypeBind, "/tmp3", "/tmp", "", "", true, false},
-		{"/tmp:/tmp4:foo", "", mount.TypeBind, "", "", "", "", false, true},
-		{"name:/named1", "", mount.TypeVolume, "/named1", "", "name", "", true, false},
-		{"name:/named2", "external", mount.TypeVolume, "/named2", "", "name", "external", true, false},
-		{"name:/named3:ro", "local", mount.TypeVolume, "/named3", "", "name", "local", false, false},
-		{"local/name:/tmp:rw", "", mount.TypeVolume, "/tmp", "", "local/name", "", true, false},
-		{"/tmp:tmp", "", mount.TypeBind, "", "", "", "", true, true},
+		{
+			bind: "/tmp:/tmp1",
+			expected: &MountPoint{
+				Source:      "/tmp",
+				Destination: "/tmp1",
+				RW:          true,
+				Type:        mount.TypeBind,
+				Propagation: "rprivate",
+				Spec: mount.Mount{
+					Source:   "/tmp",
+					Target:   "/tmp1",
+					ReadOnly: false,
+					Type:     mount.TypeBind,
+				},
+			},
+		},
+		{
+			bind: "/tmp:/tmp2:ro",
+			expected: &MountPoint{
+				Source:      "/tmp",
+				Destination: "/tmp2",
+				RW:          false,
+				Type:        mount.TypeBind,
+				Mode:        "ro",
+				Propagation: "rprivate",
+				Spec: mount.Mount{
+					Source:   "/tmp",
+					Target:   "/tmp2",
+					ReadOnly: true,
+					Type:     mount.TypeBind,
+				},
+			},
+		},
+		{
+			bind: "/tmp:/tmp3:rw",
+			expected: &MountPoint{
+				Source:      "/tmp",
+				Destination: "/tmp3",
+				RW:          true,
+				Type:        mount.TypeBind,
+				Mode:        "rw",
+				Propagation: "rprivate",
+				Spec: mount.Mount{
+					Source:   "/tmp",
+					Target:   "/tmp3",
+					ReadOnly: false,
+					Type:     mount.TypeBind,
+				},
+			},
+		},
+		{
+			bind:   "/tmp:/tmp4:foo",
+			expErr: `invalid mode: foo`,
+		},
+		{
+			bind: "name:/named1",
+			expected: &MountPoint{
+				Destination: "/named1",
+				RW:          true,
+				Name:        "name",
+				Type:        mount.TypeVolume,
+				Mode:        "", // FIXME(thaJeztah): why is this different than an explicit "rw" ?
+				Propagation: "",
+				CopyData:    true,
+				Spec: mount.Mount{
+					Source:   "name",
+					Target:   "/named1",
+					ReadOnly: false,
+					Type:     mount.TypeVolume,
+				},
+			},
+		},
+		{
+			bind:   "name:/named2",
+			driver: "external",
+			expected: &MountPoint{
+				Destination: "/named2",
+				RW:          true,
+				Name:        "name",
+				Driver:      "external",
+				Type:        mount.TypeVolume,
+				Mode:        "", // FIXME(thaJeztah): why is this different than an explicit "rw" ?
+				Propagation: "",
+				CopyData:    true,
+				Spec: mount.Mount{
+					Source:        "name",
+					Target:        "/named2",
+					ReadOnly:      false,
+					Type:          mount.TypeVolume,
+					VolumeOptions: &mount.VolumeOptions{DriverConfig: &mount.Driver{Name: "external"}},
+				},
+			},
+		},
+		{
+			bind:   "name:/named3:ro",
+			driver: "local",
+			expected: &MountPoint{
+				Destination: "/named3",
+				RW:          false,
+				Name:        "name",
+				Driver:      "local",
+				Type:        mount.TypeVolume,
+				Mode:        "ro",
+				Propagation: "",
+				CopyData:    true,
+				Spec: mount.Mount{
+					Source:        "name",
+					Target:        "/named3",
+					ReadOnly:      true,
+					Type:          mount.TypeVolume,
+					VolumeOptions: &mount.VolumeOptions{DriverConfig: &mount.Driver{Name: "local"}},
+				},
+			},
+		},
+		{
+			bind: "local/name:/tmp:rw",
+			expected: &MountPoint{
+				Destination: "/tmp",
+				RW:          true,
+				Name:        "local/name",
+				Type:        mount.TypeVolume,
+				Mode:        "rw",
+				Propagation: "",
+				CopyData:    true,
+				Spec: mount.Mount{
+					Source:   "local/name",
+					Target:   "/tmp",
+					ReadOnly: false,
+					Type:     mount.TypeVolume,
+				},
+			},
+		},
+		{
+			bind:   "/tmp:tmp",
+			expErr: `invalid volume specification: '/tmp:tmp': invalid mount config for type "bind": invalid mount path: 'tmp' mount path must be absolute`,
+		},
 	}
 
 	parser := NewLinuxParser()
@@ -125,22 +249,17 @@ func TestLinuxParseMountRawSplit(t *testing.T) {
 		p.fi = mockFiProvider{}
 	}
 
-	for i, c := range cases {
-		c := c
-		t.Run(fmt.Sprintf("%d_%s", i, c.bind), func(t *testing.T) {
-			m, err := parser.ParseMountRaw(c.bind, c.driver)
-			if c.fail {
-				assert.ErrorContains(t, err, "", "expected an error")
+	for _, tc := range tests {
+		t.Run(tc.bind, func(t *testing.T) {
+			m, err := parser.ParseMountRaw(tc.bind, tc.driver)
+			if tc.expErr != "" {
+				assert.Check(t, is.Nil(m))
+				assert.Check(t, is.Error(err, tc.expErr))
 				return
 			}
 
 			assert.NilError(t, err)
-			assert.Equal(t, m.Destination, c.expDest)
-			assert.Equal(t, m.Source, c.expSource)
-			assert.Equal(t, m.Name, c.expName)
-			assert.Equal(t, m.Driver, c.expDriver)
-			assert.Equal(t, m.RW, c.expRW)
-			assert.Equal(t, m.Type, c.expType)
+			assert.Check(t, is.DeepEqual(*m, *tc.expected, cmpopts.IgnoreUnexported(MountPoint{})))
 		})
 	}
 }
@@ -184,10 +303,11 @@ func TestConvertTmpfsOptions(t *testing.T) {
 		readOnly             bool
 		expectedSubstrings   []string
 		unexpectedSubstrings []string
+		err                  bool
 	}
 	cases := []testCase{
 		{
-			opt:                  mount.TmpfsOptions{SizeBytes: 1024 * 1024, Mode: 0700},
+			opt:                  mount.TmpfsOptions{SizeBytes: 1024 * 1024, Mode: 0o700},
 			readOnly:             false,
 			expectedSubstrings:   []string{"size=1m", "mode=700"},
 			unexpectedSubstrings: []string{"ro"},
@@ -198,23 +318,40 @@ func TestConvertTmpfsOptions(t *testing.T) {
 			expectedSubstrings:   []string{"ro"},
 			unexpectedSubstrings: []string{},
 		},
+		{
+			opt:                  mount.TmpfsOptions{Options: [][]string{{"exec"}}},
+			readOnly:             true,
+			expectedSubstrings:   []string{"ro", "exec"},
+			unexpectedSubstrings: []string{"noexec"},
+		},
+		{
+			opt: mount.TmpfsOptions{Options: [][]string{{"INVALID"}}},
+			err: true,
+		},
 	}
 	p := NewLinuxParser()
-	for _, c := range cases {
-		data, err := p.ConvertTmpfsOptions(&c.opt, c.readOnly)
+	for _, tc := range cases {
+		opt := tc.opt
+		data, err := p.ConvertTmpfsOptions(&opt, tc.readOnly)
+		if tc.err {
+			if err == nil {
+				t.Fatalf("expected error for %+v, got nil", opt)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("could not convert %+v (readOnly: %v) to string: %v",
-				c.opt, c.readOnly, err)
+				tc.opt, tc.readOnly, err)
 		}
 		t.Logf("data=%q", data)
-		for _, s := range c.expectedSubstrings {
+		for _, s := range tc.expectedSubstrings {
 			if !strings.Contains(data, s) {
-				t.Fatalf("expected substring: %s, got %v (case=%+v)", s, data, c)
+				t.Fatalf("expected substring: %s, got %v (case=%+v)", s, data, tc)
 			}
 		}
-		for _, s := range c.unexpectedSubstrings {
+		for _, s := range tc.unexpectedSubstrings {
 			if strings.Contains(data, s) {
-				t.Fatalf("unexpected substring: %s, got %v (case=%+v)", s, data, c)
+				t.Fatalf("unexpected substring: %s, got %v (case=%+v)", s, data, tc)
 			}
 		}
 	}

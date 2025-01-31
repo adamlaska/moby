@@ -1,12 +1,13 @@
 package mounts // import "github.com/docker/docker/volume/mounts"
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/mount"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestLCOWParseMountRaw(t *testing.T) {
@@ -85,45 +86,169 @@ func TestLCOWParseMountRaw(t *testing.T) {
 
 	for _, path := range valid {
 		if _, err := parser.ParseMountRaw(path, "local"); err != nil {
-			t.Errorf("ParseMountRaw(`%q`) should succeed: error %q", path, err)
+			t.Errorf("ParseMountRaw(%q) should succeed: error %q", path, err)
 		}
 	}
 
 	for path, expectedError := range invalid {
 		if mp, err := parser.ParseMountRaw(path, "local"); err == nil {
-			t.Errorf("ParseMountRaw(`%q`) should have failed validation. Err '%v' - MP: %v", path, err, mp)
+			t.Errorf("ParseMountRaw(%q) should have failed validation. Err '%v' - MP: %v", path, err, mp)
 		} else {
 			if !strings.Contains(err.Error(), expectedError) {
-				t.Errorf("ParseMountRaw(`%q`) error should contain %q, got %v", path, expectedError, err.Error())
+				t.Errorf("ParseMountRaw(%q) error should contain %q, got %v", path, expectedError, err.Error())
 			}
 		}
 	}
 }
 
 func TestLCOWParseMountRawSplit(t *testing.T) {
-	cases := []struct {
-		bind      string
-		driver    string
-		expType   mount.Type
-		expDest   string
-		expSource string
-		expName   string
-		expDriver string
-		expRW     bool
-		fail      bool
+	tests := []struct {
+		bind     string
+		driver   string
+		expected *MountPoint
+		expErr   string
 	}{
-		{`c:\:/foo`, "local", mount.TypeBind, `/foo`, `c:\`, ``, "", true, false},
-		{`c:\:/foo:ro`, "local", mount.TypeBind, `/foo`, `c:\`, ``, "", false, false},
-		{`c:\:/foo:rw`, "local", mount.TypeBind, `/foo`, `c:\`, ``, "", true, false},
-		{`c:\:/foo:foo`, "local", mount.TypeBind, `/foo`, `c:\`, ``, "", false, true},
-		{`name:/foo:rw`, "local", mount.TypeVolume, `/foo`, ``, `name`, "local", true, false},
-		{`name:/foo`, "local", mount.TypeVolume, `/foo`, ``, `name`, "local", true, false},
-		{`name:/foo:ro`, "local", mount.TypeVolume, `/foo`, ``, `name`, "local", false, false},
-		{`name:/`, "", mount.TypeVolume, ``, ``, ``, "", true, true},
-		{`driver/name:/`, "", mount.TypeVolume, ``, ``, ``, "", true, true},
-		{`\\.\pipe\foo:\\.\pipe\bar`, "local", mount.TypeNamedPipe, `\\.\pipe\bar`, `\\.\pipe\foo`, "", "", true, true},
-		{`\\.\pipe\foo:/data`, "local", mount.TypeNamedPipe, ``, ``, "", "", true, true},
-		{`c:\foo\bar:\\.\pipe\foo`, "local", mount.TypeNamedPipe, ``, ``, "", "", true, true},
+		{
+			bind:   `c:\:/foo`,
+			driver: "local",
+			expected: &MountPoint{
+				Source:      `c:\`,
+				Destination: "/foo",
+				RW:          true,
+				Type:        mount.TypeBind,
+				Propagation: "", // Propagation is not set on LCOW.
+				Spec: mount.Mount{
+					Source:   `c:\`,
+					Target:   "/foo",
+					ReadOnly: false,
+					Type:     mount.TypeBind,
+				},
+			},
+		},
+		{
+			bind:   `c:\:/foo:ro`,
+			driver: "local",
+			expected: &MountPoint{
+				Source:      `c:\`,
+				Destination: "/foo",
+				RW:          false,
+				Type:        mount.TypeBind,
+				Mode:        "ro",
+				Propagation: "", // Propagation is not set on LCOW.
+				Spec: mount.Mount{
+					Source:   `c:\`,
+					Target:   "/foo",
+					ReadOnly: true,
+					Type:     mount.TypeBind,
+				},
+			},
+		},
+		{
+			bind:   `c:\:/foo:rw`,
+			driver: "local",
+			expected: &MountPoint{
+				Source:      `c:\`,
+				Destination: "/foo",
+				RW:          true,
+				Type:        mount.TypeBind,
+				Mode:        "rw",
+				Propagation: "", // Propagation is not set on LCOW.
+				Spec: mount.Mount{
+					Source:   `c:\`,
+					Target:   "/foo",
+					ReadOnly: false,
+					Type:     mount.TypeBind,
+				},
+			},
+		},
+		{
+			bind:   `c:\:/foo:foo`,
+			driver: "local",
+			expErr: `invalid volume specification: 'c:\:/foo:foo'`,
+		},
+		{
+			bind:   `name:/foo:rw`,
+			driver: "local",
+			expected: &MountPoint{
+				Destination: "/foo",
+				RW:          true,
+				Name:        "name",
+				Driver:      "local",
+				Type:        mount.TypeVolume,
+				Mode:        "rw",
+				Propagation: "", // Propagation is not set on LCOW.
+				Spec: mount.Mount{
+					Source:        `name`,
+					Target:        "/foo",
+					ReadOnly:      false,
+					Type:          mount.TypeVolume,
+					VolumeOptions: &mount.VolumeOptions{DriverConfig: &mount.Driver{Name: "local"}},
+				},
+			},
+		},
+		{
+			bind:   `name:/foo`,
+			driver: "local",
+			expected: &MountPoint{
+				Destination: "/foo",
+				RW:          true,
+				Name:        "name",
+				Driver:      "local",
+				Type:        mount.TypeVolume,
+				Mode:        "", // FIXME(thaJeztah): why is this different than an explicit "rw" ?
+				Propagation: "", // Propagation is not set on LCOW.
+				Spec: mount.Mount{
+					Source:        `name`,
+					Target:        "/foo",
+					ReadOnly:      false,
+					Type:          mount.TypeVolume,
+					VolumeOptions: &mount.VolumeOptions{DriverConfig: &mount.Driver{Name: "local"}},
+				},
+			},
+		},
+		{
+			bind:   `name:/foo:ro`,
+			driver: "local",
+			expected: &MountPoint{
+				Destination: "/foo",
+				RW:          false,
+				Name:        "name",
+				Driver:      "local",
+				Type:        mount.TypeVolume,
+				Mode:        "ro",
+				Propagation: "", // Propagation is not set on LCOW.
+				Spec: mount.Mount{
+					Source:        `name`,
+					Target:        "/foo",
+					ReadOnly:      true,
+					Type:          mount.TypeVolume,
+					VolumeOptions: &mount.VolumeOptions{DriverConfig: &mount.Driver{Name: "local"}},
+				},
+			},
+		},
+		{
+			bind:   `name:/`,
+			expErr: `invalid volume specification: 'name:/': invalid mount config for type "volume": invalid specification: destination can't be '/'`,
+		},
+		{
+			bind:   `driver/name:/`,
+			expErr: `invalid volume specification: 'driver/name:/'`,
+		},
+		{
+			bind:   `\\.\pipe\foo:\\.\pipe\bar`,
+			driver: "local",
+			expErr: `invalid volume specification: '\\.\pipe\foo:\\.\pipe\bar'`,
+		},
+		{
+			bind:   `\\.\pipe\foo:/data`,
+			driver: "local",
+			expErr: `invalid volume specification: '\\.\pipe\foo:/data': invalid mount config for type "npipe": Linux containers on Windows do not support named pipe mounts`,
+		},
+		{
+			bind:   `c:\foo\bar:\\.\pipe\foo`,
+			driver: "local",
+			expErr: `invalid volume specification: 'c:\foo\bar:\\.\pipe\foo'`,
+		},
 	}
 
 	parser := NewLCOWParser()
@@ -131,22 +256,17 @@ func TestLCOWParseMountRawSplit(t *testing.T) {
 		p.fi = mockFiProvider{}
 	}
 
-	for i, c := range cases {
-		c := c
-		t.Run(fmt.Sprintf("%d_%s", i, c.bind), func(t *testing.T) {
-			m, err := parser.ParseMountRaw(c.bind, c.driver)
-			if c.fail {
-				assert.ErrorContains(t, err, "", "expected an error")
+	for _, tc := range tests {
+		t.Run(tc.bind, func(t *testing.T) {
+			m, err := parser.ParseMountRaw(tc.bind, tc.driver)
+			if tc.expErr != "" {
+				assert.Check(t, is.Nil(m))
+				assert.Check(t, is.Error(err, tc.expErr))
 				return
 			}
 
 			assert.NilError(t, err)
-			assert.Equal(t, m.Destination, c.expDest)
-			assert.Equal(t, m.Source, c.expSource)
-			assert.Equal(t, m.Name, c.expName)
-			assert.Equal(t, m.Driver, c.expDriver)
-			assert.Equal(t, m.RW, c.expRW)
-			assert.Equal(t, m.Type, c.expType)
+			assert.Check(t, is.DeepEqual(*m, *tc.expected, cmpopts.IgnoreUnexported(MountPoint{})))
 		})
 	}
 }

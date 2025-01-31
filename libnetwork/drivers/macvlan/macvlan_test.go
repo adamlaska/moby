@@ -1,13 +1,12 @@
 //go:build linux
-// +build linux
 
 package macvlan
 
 import (
 	"testing"
 
+	"github.com/docker/docker/internal/testutils/storeutils"
 	"github.com/docker/docker/libnetwork/driverapi"
-	"github.com/docker/docker/pkg/plugingetter"
 )
 
 const testNetworkType = "macvlan"
@@ -17,12 +16,7 @@ type driverTester struct {
 	d *driver
 }
 
-func (dt *driverTester) GetPluginGetter() plugingetter.PluginGetter {
-	return nil
-}
-
-func (dt *driverTester) RegisterDriver(name string, drv driverapi.Driver,
-	cap driverapi.Capability) error {
+func (dt *driverTester) RegisterDriver(name string, drv driverapi.Driver, cap driverapi.Capability) error {
 	if name != testNetworkType {
 		dt.t.Fatalf("Expected driver register name to be %q. Instead got %q",
 			testNetworkType, name)
@@ -37,26 +31,26 @@ func (dt *driverTester) RegisterDriver(name string, drv driverapi.Driver,
 	return nil
 }
 
-func TestMacvlanInit(t *testing.T) {
-	if err := Init(&driverTester{t: t}, nil); err != nil {
+func TestMacvlanRegister(t *testing.T) {
+	if err := Register(&driverTester{t: t}, storeutils.NewTempStore(t), nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestMacvlanNilConfig(t *testing.T) {
 	dt := &driverTester{t: t}
-	if err := Init(dt, nil); err != nil {
+	if err := Register(dt, storeutils.NewTempStore(t), nil); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := dt.d.initStore(nil); err != nil {
+	if err := dt.d.initStore(); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestMacvlanType(t *testing.T) {
 	dt := &driverTester{t: t}
-	if err := Init(dt, nil); err != nil {
+	if err := Register(dt, storeutils.NewTempStore(t), nil); err != nil {
 		t.Fatal(err)
 	}
 

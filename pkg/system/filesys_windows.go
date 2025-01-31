@@ -2,80 +2,77 @@ package system // import "github.com/docker/docker/pkg/system"
 
 import (
 	"os"
-	"regexp"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-const (
-	// SddlAdministratorsLocalSystem is local administrators plus NT AUTHORITY\System
-	SddlAdministratorsLocalSystem = "D:P(A;OICI;GA;;;BA)(A;OICI;GA;;;SY)"
-)
+// SddlAdministratorsLocalSystem is local administrators plus NT AUTHORITY\System.
+const SddlAdministratorsLocalSystem = "D:P(A;OICI;GA;;;BA)(A;OICI;GA;;;SY)"
 
-// MkdirAllWithACL is a wrapper for MkdirAll that creates a directory
-// with an appropriate SDDL defined ACL.
-func MkdirAllWithACL(path string, perm os.FileMode, sddl string) error {
-	return mkdirall(path, true, sddl)
-}
-
-// MkdirAll implementation that is volume path aware for Windows. It can be used
-// as a drop-in replacement for os.MkdirAll()
-func MkdirAll(path string, _ os.FileMode) error {
-	return mkdirall(path, false, "")
-}
-
-// mkdirall is a custom version of os.MkdirAll modified for use on Windows
+// MkdirAllWithACL is a custom version of os.MkdirAll modified for use on Windows
 // so that it is both volume path aware, and can create a directory with
-// a DACL.
-func mkdirall(path string, applyACL bool, sddl string) error {
-	if re := regexp.MustCompile(`^\\\\\?\\Volume{[a-z0-9-]+}$`); re.MatchString(path) {
-		return nil
+// an appropriate SDDL defined ACL.
+func MkdirAllWithACL(path string, _ os.FileMode, sddl string) error {
+	sa, err := makeSecurityAttributes(sddl)
+	if err != nil {
+		return &os.PathError{Op: "mkdirall", Path: path, Err: err}
 	}
+	return mkdirAllWithACL(path, sa)
+}
 
-	// The rest of this method is largely copied from os.MkdirAll and should be kept
-	// as-is to ensure compatibility.
-
+// mkdirAllWithACL is a custom version of os.MkdirAll with DACL support on Windows.
+// It is fully identical to [os.MkdirAll] if no DACL is provided.
+//
+// Code in this function is based on the implementation in [go1.23.4].
+//
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+//
+// [go1.23.4]: https://github.com/golang/go/blob/go1.23.4/src/os/path.go#L12-L66
+func mkdirAllWithACL(path string, perm *windows.SecurityAttributes) error {
+	if perm == nil {
+		return os.MkdirAll(path, 0)
+	}
 	// Fast path: if we can tell whether path is a directory or file, stop with success or error.
 	dir, err := os.Stat(path)
 	if err == nil {
 		if dir.IsDir() {
 			return nil
 		}
-		return &os.PathError{
-			Op:   "mkdir",
-			Path: path,
-			Err:  syscall.ENOTDIR,
-		}
+		return &os.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
 	}
 
 	// Slow path: make sure parent exists and then call Mkdir for path.
-	i := len(path)
-	for i > 0 && os.IsPathSeparator(path[i-1]) { // Skip trailing path separator.
+
+	// Extract the parent folder from path by first removing any trailing
+	// path separator and then scanning backward until finding a path
+	// separator or reaching the beginning of the string.
+	i := len(path) - 1
+	for i >= 0 && os.IsPathSeparator(path[i]) {
 		i--
 	}
-
-	j := i
-	for j > 0 && !os.IsPathSeparator(path[j-1]) { // Scan backward over element.
-		j--
+	for i >= 0 && !os.IsPathSeparator(path[i]) {
+		i--
+	}
+	if i < 0 {
+		i = 0
 	}
 
-	if j > 1 {
-		// Create parent
-		err = mkdirall(path[0:j-1], false, sddl)
+	// If there is a parent directory, and it is not the volume name,
+	// recurse to ensure parent directory exists.
+	if parent := path[:i]; len(parent) > len(filepath.VolumeName(path)) {
+		err = mkdirAllWithACL(parent, perm)
 		if err != nil {
 			return err
 		}
 	}
 
-	// Parent now exists; invoke os.Mkdir or mkdirWithACL and use its result.
-	if applyACL {
-		err = mkdirWithACL(path, sddl)
-	} else {
-		err = os.Mkdir(path, 0)
-	}
-
+	// Parent now exists; invoke Mkdir and use its result.
+	err = mkdirWithACL(path, perm)
 	if err != nil {
 		// Handle arguments like "foo/." by
 		// double-checking that directory doesn't exist.
@@ -95,24 +92,31 @@ func mkdirall(path string, applyACL bool, sddl string) error {
 // in golang to cater for creating a directory am ACL permitting full
 // access, with inheritance, to any subfolder/file for Built-in Administrators
 // and Local System.
-func mkdirWithACL(name string, sddl string) error {
-	sa := windows.SecurityAttributes{Length: 0}
-	sd, err := windows.SecurityDescriptorFromString(sddl)
-	if err != nil {
-		return &os.PathError{Op: "mkdir", Path: name, Err: err}
+func mkdirWithACL(name string, sa *windows.SecurityAttributes) error {
+	if sa == nil {
+		return os.Mkdir(name, 0)
 	}
-	sa.Length = uint32(unsafe.Sizeof(sa))
-	sa.InheritHandle = 1
-	sa.SecurityDescriptor = sd
 
 	namep, err := windows.UTF16PtrFromString(name)
 	if err != nil {
 		return &os.PathError{Op: "mkdir", Path: name, Err: err}
 	}
 
-	e := windows.CreateDirectory(namep, &sa)
-	if e != nil {
-		return &os.PathError{Op: "mkdir", Path: name, Err: e}
+	err = windows.CreateDirectory(namep, sa)
+	if err != nil {
+		return &os.PathError{Op: "mkdir", Path: name, Err: err}
 	}
 	return nil
+}
+
+func makeSecurityAttributes(sddl string) (*windows.SecurityAttributes, error) {
+	var sa windows.SecurityAttributes
+	sa.Length = uint32(unsafe.Sizeof(sa))
+	sa.InheritHandle = 1
+	var err error
+	sa.SecurityDescriptor, err = windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		return nil, err
+	}
+	return &sa, nil
 }

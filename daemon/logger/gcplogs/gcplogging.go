@@ -11,7 +11,7 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/logging"
-	"github.com/sirupsen/logrus"
+	"github.com/containerd/log"
 	mrpb "google.golang.org/genproto/googleapis/api/monitoredres"
 )
 
@@ -31,7 +31,7 @@ const (
 
 var (
 	// The number of logs the gcplogs driver has dropped.
-	droppedLogs uint64
+	droppedLogs atomic.Uint64
 
 	onGCE bool
 
@@ -91,10 +91,11 @@ func initGCP() {
 			// down or the client is compiled with an API version that
 			// has been removed. Since these are not vital, let's ignore
 			// them and make their fields in the dockerLogEntry ,omitempty
-			projectID, _ = metadata.ProjectID()
-			zone, _ = metadata.Zone()
-			instanceName, _ = metadata.InstanceName()
-			instanceID, _ = metadata.InstanceID()
+			ctx := context.Background()
+			projectID, _ = metadata.ProjectIDWithContext(ctx)
+			zone, _ = metadata.ZoneWithContext(ctx)
+			instanceName, _ = metadata.InstanceNameWithContext(ctx)
+			instanceID, _ = metadata.InstanceIDWithContext(ctx)
 		}
 	})
 }
@@ -115,15 +116,6 @@ func New(info logger.Info) (logger.Logger, error) {
 	}
 	if project == "" {
 		return nil, fmt.Errorf("No project was specified and couldn't read project from the metadata server. Please specify a project")
-	}
-
-	// Issue #29344: gcplogs segfaults (static binary)
-	// If HOME is not set, logging.NewClient() will call os/user.Current() via oauth2/google.
-	// However, in static binary, os/user.Current() leads to segfault due to a glibc issue that won't be fixed
-	// in a short term. (golang/go#13470, https://sourceware.org/bugzilla/show_bug.cgi?id=19341)
-	// So we forcibly set HOME so as to avoid call to os/user/Current()
-	if err := ensureHomeIfIAmStatic(); err != nil {
-		return nil, err
 	}
 
 	c, err := logging.NewClient(context.Background(), project)
@@ -196,11 +188,11 @@ func New(info logger.Info) (logger.Logger, error) {
 	// we overflow and every 1000th time after.
 	c.OnError = func(err error) {
 		if err == logging.ErrOverflow {
-			if i := atomic.AddUint64(&droppedLogs, 1); i%1000 == 1 {
-				logrus.Errorf("gcplogs driver has dropped %v logs", i)
+			if i := droppedLogs.Add(1); i%1000 == 1 {
+				log.G(context.TODO()).Errorf("gcplogs driver has dropped %v logs", i)
 			}
 		} else {
-			logrus.Error(err)
+			log.G(context.TODO()).Error(err)
 		}
 	}
 

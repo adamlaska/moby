@@ -3,49 +3,29 @@ package libnetwork
 import (
 	"testing"
 
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libnetwork/types"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func TestErrorInterfaces(t *testing.T) {
-
-	badRequestErrorList := []error{ErrInvalidID(""), ErrInvalidName(""), ErrInvalidJoin{}, ErrInvalidNetworkDriver(""), InvalidContainerIDError(""), ErrNoSuchNetwork(""), ErrNoSuchEndpoint("")}
-	for _, err := range badRequestErrorList {
-		switch u := err.(type) {
-		case types.BadRequestError:
-			return
-		default:
-			t.Fatalf("Failed to detect err %v is of type BadRequestError. Got type: %T", err, u)
-		}
-	}
-
-	maskableErrorList := []error{ErrNoContainer{}}
+	maskableErrorList := []error{ManagerRedirectError("")}
 	for _, err := range maskableErrorList {
 		switch u := err.(type) {
 		case types.MaskableError:
-			return
 		default:
-			t.Fatalf("Failed to detect err %v is of type MaskableError. Got type: %T", err, u)
+			t.Errorf("Failed to detect err %v is of type MaskableError. Got type: %T", err, u)
 		}
 	}
 
-	notFoundErrorList := []error{NetworkTypeError(""), &UnknownNetworkError{}, &UnknownEndpointError{}}
+	notFoundErrorList := []error{ErrNoSuchNetwork("")}
 	for _, err := range notFoundErrorList {
-		switch u := err.(type) {
-		case types.NotFoundError:
-			return
-		default:
-			t.Fatalf("Failed to detect err %v is of type NotFoundError. Got type: %T", err, u)
-		}
+		assert.Check(t, is.ErrorType(err, errdefs.IsNotFound))
 	}
 
-	forbiddenErrorList := []error{NetworkTypeError(""), &UnknownNetworkError{}, &UnknownEndpointError{}}
+	forbiddenErrorList := []error{&ActiveContainerError{}}
 	for _, err := range forbiddenErrorList {
-		switch u := err.(type) {
-		case types.ForbiddenError:
-			return
-		default:
-			t.Fatalf("Failed to detect err %v is of type ForbiddenError. Got type: %T", err, u)
-		}
+		assert.Check(t, is.ErrorType(err, errdefs.IsForbidden))
 	}
-
 }

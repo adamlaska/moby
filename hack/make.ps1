@@ -256,12 +256,6 @@ Function Validate-PkgImports($headCommit, $upstreamCommit) {
     $files=@(); $files = Invoke-Expression "git diff $upstreamCommit...$headCommit --diff-filter=ACMR --name-only -- `'pkg\*.go`'"
     $badFiles=@(); $files | ForEach-Object{
         $file=$_
-        if ($file -eq "pkg\urlutil\deprecated.go") {
-            # pkg/urlutil is deprecated, but has a temporary alias to help migration,
-            # see https://github.com/moby/moby/pull/43477
-            # TODO(thaJeztah) remove this exception once pkg/urlutil aliases are removed
-            return
-        }
         # For the current changed file, get its list of dependencies, sorted and uniqued.
         $imports = Invoke-Expression "go list -e -f `'{{ .Deps }}`' $file"
         if ($LASTEXITCODE -ne 0) { Throw "Failed go list for dependencies on $file" }
@@ -269,6 +263,7 @@ Function Validate-PkgImports($headCommit, $upstreamCommit) {
         # Filter out what we are looking for
         $imports = @() + $imports -NotMatch "^github.com/docker/docker/pkg/" `
                                   -NotMatch "^github.com/docker/docker/vendor" `
+                                  -NotMatch "^github.com/docker/docker/internal" `
                                   -Match "^github.com/docker/docker" `
                                   -Replace "`n", ""
         $imports | ForEach-Object{ $badFiles+="$file imports $_`n" }
@@ -332,10 +327,26 @@ Function Run-UnitTests() {
     $pkgList = $pkgList | Select-String -NotMatch "github.com/docker/docker/integration"
     $pkgList = $pkgList -replace "`r`n", " "
 
+    $jsonFilePath = $bundlesDir + "\go-test-report-unit-flaky-tests.json"
+    $xmlFilePath = $bundlesDir + "\junit-report-unit-flaky-tests.xml"
+    $coverageFilePath = $bundlesDir + "\coverage-report-unit-flaky-tests.txt"
+    $goTestArg = "--rerun-fails=4  --format=standard-verbose --jsonfile=$jsonFilePath --junitfile=$xmlFilePath """ + "--packages=$pkgList" + """ -- " + $raceParm + " -coverprofile=$coverageFilePath -covermode=atomic -ldflags -w -a -test.timeout=10m -test.run=TestFlaky.*"
+    Write-Host "INFO: Invoking unit tests run with $GOTESTSUM_LOCATION\gotestsum.exe $goTestArg"
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName = "$GOTESTSUM_LOCATION\gotestsum.exe"
+    $pinfo.WorkingDirectory = "$($PWD.Path)"
+    $pinfo.UseShellExecute = $false
+    $pinfo.Arguments = $goTestArg
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $pinfo
+    $p.Start() | Out-Null
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { Throw "Unit tests (flaky) failed" }
+
     $jsonFilePath = $bundlesDir + "\go-test-report-unit-tests.json"
     $xmlFilePath = $bundlesDir + "\junit-report-unit-tests.xml"
     $coverageFilePath = $bundlesDir + "\coverage-report-unit-tests.txt"
-    $goTestArg = "--format=standard-verbose --jsonfile=$jsonFilePath --junitfile=$xmlFilePath -- " + $raceParm + " -coverprofile=$coverageFilePath -covermode=atomic -ldflags -w -a """ + "-test.timeout=10m" + """ $pkgList"
+    $goTestArg = "--format=standard-verbose --jsonfile=$jsonFilePath --junitfile=$xmlFilePath -- " + $raceParm + " -coverprofile=$coverageFilePath -covermode=atomic -ldflags -w -a -test.timeout=10m -test.skip=TestFlaky.*" + " $pkgList"
     Write-Host "INFO: Invoking unit tests run with $GOTESTSUM_LOCATION\gotestsum.exe $goTestArg"
     $pinfo = New-Object System.Diagnostics.ProcessStartInfo
     $pinfo.FileName = "$GOTESTSUM_LOCATION\gotestsum.exe"
@@ -353,7 +364,7 @@ Function Run-UnitTests() {
 Function Run-IntegrationTests() {
     $escRoot = [Regex]::Escape($root)
     $env:DOCKER_INTEGRATION_DAEMON_DEST = $bundlesDir + "\tmp"
-    $dirs = go list -test -f '{{- if ne .ForTest `"`" -}}{{- .Dir -}}{{- end -}}' .\integration\...
+    $dirs = go list -test -f '{{- if ne .ForTest "" -}}{{- .Dir -}}{{- end -}}' .\integration\...
     ForEach($dir in $dirs) {
         # Normalize directory name for using in the test results files.
         $normDir = $dir.Trim()
@@ -464,7 +475,7 @@ Try {
     if (-not $inContainer) { Verify-GoVersion }
 
     # Verify GOPATH is set
-    if ($env:GOPATH.Length -eq 0) { Throw "Missing GOPATH environment variable. See https://golang.org/doc/code.html#GOPATH" }
+    if ($env:GOPATH.Length -eq 0) { Throw "Missing GOPATH environment variable. See https://pkg.go.dev/cmd/go#hdr-GOPATH_environment_variable" }
 
     # Run autogen if building daemon.
     if ($Daemon) {

@@ -1,11 +1,14 @@
 package main
 
 import (
+	"runtime"
 	"testing"
 
+	"github.com/containerd/log"
 	"github.com/docker/docker/daemon/config"
-	"github.com/sirupsen/logrus"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/spf13/pflag"
+	"go.opentelemetry.io/otel"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/fs"
@@ -17,11 +20,8 @@ func defaultOptions(t *testing.T, configFile string) *daemonOptions {
 	opts := newDaemonOptions(cfg)
 	opts.flags = &pflag.FlagSet{}
 	opts.installFlags(opts.flags)
-	err = installConfigFlags(opts.daemonConfig, opts.flags)
-	assert.NilError(t, err)
-	defaultDaemonConfigFile, err := getDefaultDaemonConfigFile()
-	assert.NilError(t, err)
-	opts.flags.StringVar(&opts.configFile, "config-file", defaultDaemonConfigFile, "")
+	installConfigFlags(opts.daemonConfig, opts.flags)
+	opts.flags.StringVar(&opts.configFile, "config-file", opts.configFile, "")
 	opts.configFile = configFile
 	err = opts.flags.Parse([]string{})
 	assert.NilError(t, err)
@@ -48,7 +48,7 @@ func TestLoadDaemonCliConfigWithTLS(t *testing.T) {
 	loadedConfig, err := loadDaemonCliConfig(opts)
 	assert.NilError(t, err)
 	assert.Assert(t, loadedConfig != nil)
-	assert.Check(t, is.Equal("/tmp/ca.pem", loadedConfig.CommonTLSOptions.CAFile))
+	assert.Check(t, is.Equal("/tmp/ca.pem", loadedConfig.TLSOptions.CAFile))
 }
 
 func TestLoadDaemonCliConfigWithConflicts(t *testing.T) {
@@ -141,7 +141,7 @@ func TestLoadDaemonCliConfigWithoutTLSVerify(t *testing.T) {
 	loadedConfig, err := loadDaemonCliConfig(opts)
 	assert.NilError(t, err)
 	assert.Assert(t, loadedConfig != nil)
-	assert.Check(t, loadedConfig.TLS == nil)
+	assert.Check(t, is.Nil(loadedConfig.TLS))
 }
 
 func TestLoadDaemonCliConfigWithLogLevel(t *testing.T) {
@@ -155,6 +155,26 @@ func TestLoadDaemonCliConfigWithLogLevel(t *testing.T) {
 	assert.Check(t, is.Equal("warn", loadedConfig.LogLevel))
 }
 
+func TestLoadDaemonCliConfigWithLogFormat(t *testing.T) {
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"log-format": "json"}`))
+	defer tempFile.Remove()
+
+	opts := defaultOptions(t, tempFile.Path())
+	loadedConfig, err := loadDaemonCliConfig(opts)
+	assert.NilError(t, err)
+	assert.Assert(t, loadedConfig != nil)
+	assert.Check(t, is.Equal(log.JSONFormat, loadedConfig.LogFormat))
+}
+
+func TestLoadDaemonCliConfigWithInvalidLogFormat(t *testing.T) {
+	tempFile := fs.NewFile(t, "config", fs.WithContent(`{"log-format": "foo"}`))
+	defer tempFile.Remove()
+
+	opts := defaultOptions(t, tempFile.Path())
+	_, err := loadDaemonCliConfig(opts)
+	assert.Check(t, is.ErrorContains(err, "invalid log format: foo"))
+}
+
 func TestLoadDaemonConfigWithEmbeddedOptions(t *testing.T) {
 	content := `{"tlscacert": "/etc/certs/ca.pem", "log-driver": "syslog"}`
 	tempFile := fs.NewFile(t, "config", fs.WithContent(content))
@@ -164,13 +184,12 @@ func TestLoadDaemonConfigWithEmbeddedOptions(t *testing.T) {
 	loadedConfig, err := loadDaemonCliConfig(opts)
 	assert.NilError(t, err)
 	assert.Assert(t, loadedConfig != nil)
-	assert.Check(t, is.Equal("/etc/certs/ca.pem", loadedConfig.CommonTLSOptions.CAFile))
+	assert.Check(t, is.Equal("/etc/certs/ca.pem", loadedConfig.TLSOptions.CAFile))
 	assert.Check(t, is.Equal("syslog", loadedConfig.LogConfig.Type))
 }
 
 func TestLoadDaemonConfigWithRegistryOptions(t *testing.T) {
 	content := `{
-		"allow-nondistributable-artifacts": ["allow-nondistributable-artifacts.example.com"],
 		"registry-mirrors": ["https://mirrors.example.com"],
 		"insecure-registries": ["https://insecure-registry.example.com"]
 	}`
@@ -182,7 +201,6 @@ func TestLoadDaemonConfigWithRegistryOptions(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Assert(t, loadedConfig != nil)
 
-	assert.Check(t, is.Len(loadedConfig.AllowNondistributableArtifacts, 1))
 	assert.Check(t, is.Len(loadedConfig.Mirrors, 1))
 	assert.Check(t, is.Len(loadedConfig.InsecureRegistries, 1))
 }
@@ -190,14 +208,107 @@ func TestLoadDaemonConfigWithRegistryOptions(t *testing.T) {
 func TestConfigureDaemonLogs(t *testing.T) {
 	conf := &config.Config{}
 	configureDaemonLogs(conf)
-	assert.Check(t, is.Equal(logrus.InfoLevel, logrus.GetLevel()))
-
-	conf.LogLevel = "warn"
-	configureDaemonLogs(conf)
-	assert.Check(t, is.Equal(logrus.WarnLevel, logrus.GetLevel()))
+	assert.Check(t, is.Equal(log.InfoLevel, log.GetLevel()))
 
 	// log level should not be changed when passing an invalid value
 	conf.LogLevel = "foobar"
 	configureDaemonLogs(conf)
-	assert.Check(t, is.Equal(logrus.WarnLevel, logrus.GetLevel()))
+	assert.Check(t, is.Equal(log.InfoLevel, log.GetLevel()))
+
+	conf.LogLevel = "warn"
+	configureDaemonLogs(conf)
+	assert.Check(t, is.Equal(log.WarnLevel, log.GetLevel()))
+}
+
+func TestCDISpecDirs(t *testing.T) {
+	testCases := []struct {
+		description         string
+		configContent       string
+		specDirs            []string
+		expectedCDISpecDirs []string
+	}{
+		{
+			description:         "CDI enabled and no spec dirs specified returns default",
+			specDirs:            nil,
+			configContent:       `{"features": {"cdi": true}}`,
+			expectedCDISpecDirs: []string{"/etc/cdi", "/var/run/cdi"},
+		},
+		{
+			description:         "CDI enabled and specified spec dirs are returned",
+			specDirs:            []string{"/foo/bar", "/baz/qux"},
+			configContent:       `{"features": {"cdi": true}}`,
+			expectedCDISpecDirs: []string{"/foo/bar", "/baz/qux"},
+		},
+		{
+			description:         "CDI enabled and empty string as spec dir returns empty slice",
+			specDirs:            []string{""},
+			configContent:       `{"features": {"cdi": true}}`,
+			expectedCDISpecDirs: []string{},
+		},
+		{
+			description:         "CDI enabled and empty config option returns empty slice",
+			configContent:       `{"cdi-spec-dirs": [], "features": {"cdi": true}}`,
+			expectedCDISpecDirs: []string{},
+		},
+		{
+			description:         "CDI disabled and no spec dirs specified returns no cdi spec dirs",
+			specDirs:            nil,
+			expectedCDISpecDirs: nil,
+		},
+		{
+			description:         "CDI disabled and specified spec dirs returns no cdi spec dirs",
+			specDirs:            []string{"/foo/bar", "/baz/qux"},
+			expectedCDISpecDirs: nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			tempFile := fs.NewFile(t, "config", fs.WithContent(tc.configContent))
+			defer tempFile.Remove()
+
+			opts := defaultOptions(t, tempFile.Path())
+
+			flags := opts.flags
+			for _, specDir := range tc.specDirs {
+				assert.Check(t, flags.Set("cdi-spec-dir", specDir))
+			}
+
+			loadedConfig, err := loadDaemonCliConfig(opts)
+			assert.NilError(t, err)
+
+			assert.Check(t, is.DeepEqual(tc.expectedCDISpecDirs, loadedConfig.CDISpecDirs, cmpopts.EquateEmpty()))
+		})
+	}
+}
+
+// TestOtelMeterLeak is a regression test for a memory leak in the OTEL meter
+// implementation that was fixed in OTEL v1.30.0.
+//
+// See:
+// - https://github.com/open-telemetry/opentelemetry-go-contrib/issues/5190
+// - https://github.com/moby/moby/pull/48690
+// - https://github.com/moby/moby/issues/48144
+func TestOtelMeterLeak(t *testing.T) {
+	meter := otel.Meter("foo")
+
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	const counters = 10 * 1000 * 1000
+	for i := 0; i < counters; i++ {
+		_, _ = meter.Int64Counter("bar")
+	}
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	allocs := after.Mallocs - before.Mallocs
+	t.Log("Allocations:", allocs)
+
+	// currently, with OTel v1.31.0, allocations is 3; add some margin to
+	// check for unexpectedly more than that.
+	if allocs > 10 {
+		t.Fatalf("Possible OTel leak; got more than 10 allocations (allocs: %d).", allocs)
+	}
 }

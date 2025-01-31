@@ -15,15 +15,15 @@ import (
 
 	cfconfig "github.com/cloudflare/cfssl/config"
 	events "github.com/docker/go-events"
+	"github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
+	"google.golang.org/grpc/credentials"
+
 	"github.com/moby/swarmkit/v2/api"
 	"github.com/moby/swarmkit/v2/connectionbroker"
 	"github.com/moby/swarmkit/v2/identity"
 	"github.com/moby/swarmkit/v2/log"
 	"github.com/moby/swarmkit/v2/watch"
-	"github.com/opencontainers/go-digest"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"google.golang.org/grpc/credentials"
 )
 
 const (
@@ -367,16 +367,16 @@ func GenerateJoinToken(rootCA *RootCA, fips bool) string {
 		panic(fmt.Errorf("failed to read random bytes: %v", err))
 	}
 
-	var nn, digest big.Int
+	var nn, dgst big.Int
 	nn.SetBytes(secretBytes[:])
-	digest.SetString(rootCA.Digest.Hex(), 16)
+	dgst.SetString(rootCA.Digest.Encoded(), 16)
 
 	fmtString := "SWMTKN-1-%0[1]*s-%0[3]*s"
 	if fips {
 		fmtString = "SWMTKN-2-1-%0[1]*s-%0[3]*s"
 	}
 	return fmt.Sprintf(fmtString, base36DigestLen,
-		digest.Text(joinTokenBase), maxGeneratedSecretLength, nn.Text(joinTokenBase))
+		dgst.Text(joinTokenBase), maxGeneratedSecretLength, nn.Text(joinTokenBase))
 }
 
 // DownloadRootCA tries to retrieve a remote root CA and matches the digest against the provided token.
@@ -463,7 +463,7 @@ func LoadSecurityConfig(ctx context.Context, rootCA RootCA, krw *KeyReadWriter, 
 		PublicKey: issuer.RawSubjectPublicKeyInfo,
 	})
 	if err == nil {
-		log.G(ctx).WithFields(logrus.Fields{
+		log.G(ctx).WithFields(log.Fields{
 			"node.id":   secConfig.ClientTLSCreds.NodeID(),
 			"node.role": secConfig.ClientTLSCreds.Role(),
 		}).Debug("loaded node credentials")
@@ -524,12 +524,12 @@ func (rootCA RootCA) CreateSecurityConfig(ctx context.Context, krw *KeyReadWrite
 			return nil, nil, err
 		}
 	case nil:
-		log.G(ctx).WithFields(logrus.Fields{
+		log.G(ctx).WithFields(log.Fields{
 			"node.id":   cn,
 			"node.role": proposedRole,
 		}).Debug("issued new TLS certificate")
 	default:
-		log.G(ctx).WithFields(logrus.Fields{
+		log.G(ctx).WithFields(log.Fields{
 			"node.id":   cn,
 			"node.role": proposedRole,
 		}).WithError(err).Errorf("failed to issue and save new certificate")
@@ -538,7 +538,7 @@ func (rootCA RootCA) CreateSecurityConfig(ctx context.Context, krw *KeyReadWrite
 
 	secConfig, cleanup, err := NewSecurityConfig(&rootCA, krw, tlsKeyPair, issuerInfo)
 	if err == nil {
-		log.G(ctx).WithFields(logrus.Fields{
+		log.G(ctx).WithFields(log.Fields{
 			"node.id":   secConfig.ClientTLSCreds.NodeID(),
 			"node.role": secConfig.ClientTLSCreds.Role(),
 		}).Debugf("new node credentials generated: %s", krw.Target())
@@ -579,7 +579,7 @@ func RenewTLSConfigNow(ctx context.Context, s *SecurityConfig, connBroker *conne
 	defer s.renewalMu.Unlock()
 
 	ctx = log.WithModule(ctx, "tls")
-	log := log.G(ctx).WithFields(logrus.Fields{
+	logger := log.G(ctx).WithFields(log.Fields{
 		"node.id":   s.ClientTLSCreds.NodeID(),
 		"node.role": s.ClientTLSCreds.Role(),
 	})
@@ -602,7 +602,7 @@ func RenewTLSConfigNow(ctx context.Context, s *SecurityConfig, connBroker *conne
 		}
 	}
 	if err != nil {
-		log.WithError(err).Errorf("failed to renew the certificate")
+		logger.WithError(err).Errorf("failed to renew the certificate")
 		return err
 	}
 
@@ -650,6 +650,7 @@ func NewServerTLSConfig(certs []tls.Certificate, rootCAPool *x509.CertPool) (*tl
 		ClientCAs:                rootCAPool,
 		PreferServerCipherSuites: true,
 		MinVersion:               tls.VersionTLS12,
+		NextProtos:               alpnProtoStr,
 	}, nil
 }
 

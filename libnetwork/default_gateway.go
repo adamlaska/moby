@@ -1,12 +1,14 @@
 package libnetwork
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
+	"github.com/containerd/log"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/types"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -29,8 +31,7 @@ var procGwNetwork = make(chan (bool), 1)
    - its deleted when an endpoint with GW joins the container
 */
 
-func (sb *sandbox) setupDefaultGW() error {
-
+func (sb *Sandbox) setupDefaultGW() error {
 	// check if the container already has a GW endpoint
 	if ep := sb.getEndpointInGWNetwork(); ep != nil {
 		return nil
@@ -47,7 +48,7 @@ func (sb *sandbox) setupDefaultGW() error {
 		}
 	}
 
-	createOptions := []EndpointOption{CreateOptionAnonymous()}
+	createOptions := []EndpointOption{}
 
 	var gwName string
 	if len(sb.containerID) <= gwEPlen {
@@ -71,23 +72,21 @@ func (sb *sandbox) setupDefaultGW() error {
 		createOptions = append(createOptions, epOption)
 	}
 
-	newEp, err := n.CreateEndpoint(gwName, createOptions...)
+	newEp, err := n.CreateEndpoint(context.TODO(), gwName, createOptions...)
 	if err != nil {
 		return fmt.Errorf("container %s: endpoint create on GW Network failed: %v", sb.containerID, err)
 	}
 
 	defer func() {
 		if err != nil {
-			if err2 := newEp.Delete(true); err2 != nil {
-				logrus.Warnf("Failed to remove gw endpoint for container %s after failing to join the gateway network: %v",
+			if err2 := newEp.Delete(context.WithoutCancel(context.TODO()), true); err2 != nil {
+				log.G(context.TODO()).Warnf("Failed to remove gw endpoint for container %s after failing to join the gateway network: %v",
 					sb.containerID, err2)
 			}
 		}
 	}()
 
-	epLocal := newEp.(*endpoint)
-
-	if err = epLocal.sbJoin(sb); err != nil {
+	if err = newEp.sbJoin(context.TODO(), sb); err != nil {
 		return fmt.Errorf("container %s: endpoint join on GW Network failed: %v", sb.containerID, err)
 	}
 
@@ -95,16 +94,16 @@ func (sb *sandbox) setupDefaultGW() error {
 }
 
 // If present, detach and remove the endpoint connecting the sandbox to the default gw network.
-func (sb *sandbox) clearDefaultGW() error {
-	var ep *endpoint
+func (sb *Sandbox) clearDefaultGW() error {
+	var ep *Endpoint
 
 	if ep = sb.getEndpointInGWNetwork(); ep == nil {
 		return nil
 	}
-	if err := ep.sbLeave(sb, false); err != nil {
+	if err := ep.sbLeave(context.TODO(), sb, false); err != nil {
 		return fmt.Errorf("container %s: endpoint leaving GW Network failed: %v", sb.containerID, err)
 	}
-	if err := ep.Delete(false); err != nil {
+	if err := ep.Delete(context.TODO(), false); err != nil {
 		return fmt.Errorf("container %s: deleting endpoint on GW Network failed: %v", sb.containerID, err)
 	}
 	return nil
@@ -114,10 +113,10 @@ func (sb *sandbox) clearDefaultGW() error {
 // on the endpoints to which it is connected. It does not account
 // for the default gateway network endpoint.
 
-func (sb *sandbox) needDefaultGW() bool {
+func (sb *Sandbox) needDefaultGW() bool {
 	var needGW bool
 
-	for _, ep := range sb.getConnectedEndpoints() {
+	for _, ep := range sb.Endpoints() {
 		if ep.endpointInGWNetwork() {
 			continue
 		}
@@ -131,8 +130,10 @@ func (sb *sandbox) needDefaultGW() bool {
 		if ep.joinInfo != nil && ep.joinInfo.disableGatewayService {
 			continue
 		}
-		// TODO v6 needs to be handled.
 		if len(ep.Gateway()) > 0 {
+			return false
+		}
+		if len(ep.GatewayIPv6()) > 0 {
 			return false
 		}
 		for _, r := range ep.StaticRoutes() {
@@ -146,8 +147,8 @@ func (sb *sandbox) needDefaultGW() bool {
 	return needGW
 }
 
-func (sb *sandbox) getEndpointInGWNetwork() *endpoint {
-	for _, ep := range sb.getConnectedEndpoints() {
+func (sb *Sandbox) getEndpointInGWNetwork() *Endpoint {
+	for _, ep := range sb.Endpoints() {
 		if ep.getNetwork().name == libnGWNetwork && strings.HasPrefix(ep.Name(), "gateway_") {
 			return ep
 		}
@@ -155,7 +156,7 @@ func (sb *sandbox) getEndpointInGWNetwork() *endpoint {
 	return nil
 }
 
-func (ep *endpoint) endpointInGWNetwork() bool {
+func (ep *Endpoint) endpointInGWNetwork() bool {
 	if ep.getNetwork().name == libnGWNetwork && strings.HasPrefix(ep.Name(), "gateway_") {
 		return true
 	}
@@ -164,26 +165,52 @@ func (ep *endpoint) endpointInGWNetwork() bool {
 
 // Looks for the default gw network and creates it if not there.
 // Parallel executions are serialized.
-func (c *controller) defaultGwNetwork() (Network, error) {
+func (c *Controller) defaultGwNetwork() (*Network, error) {
 	procGwNetwork <- true
 	defer func() { <-procGwNetwork }()
 
 	n, err := c.NetworkByName(libnGWNetwork)
-	if _, ok := err.(types.NotFoundError); ok {
+	if errdefs.IsNotFound(err) {
 		n, err = c.createGWNetwork()
 	}
 	return n, err
 }
 
-// Returns the endpoint which is providing external connectivity to the sandbox
-func (sb *sandbox) getGatewayEndpoint() *endpoint {
-	for _, ep := range sb.getConnectedEndpoints() {
+// getGatewayEndpoint returns the endpoints providing external connectivity to
+// the sandbox. If the gateway is dual-stack, ep4 and ep6 will point at the same
+// endpoint. If there is no IPv4/IPv6 connectivity, nil pointers will be returned.
+func (sb *Sandbox) getGatewayEndpoint() (ep4, ep6 *Endpoint) {
+	return selectGatewayEndpoint(sb.Endpoints())
+}
+
+// selectGatewayEndpoint is like getGatewayEndpoint, but selects only from
+// endpoints.
+func selectGatewayEndpoint(endpoints []*Endpoint) (ep4, ep6 *Endpoint) {
+	for _, ep := range endpoints {
 		if ep.getNetwork().Type() == "null" || ep.getNetwork().Type() == "host" {
 			continue
 		}
-		if len(ep.Gateway()) != 0 {
-			return ep
+		gw4, gw6 := ep.hasGatewayOrDefaultRoute()
+		if gw4 && gw6 {
+			// The first dual-stack endpoint is the gateway, no need to search further.
+			//
+			// FIXME(robmry) - this means a dual-stack gateway is preferred over single-stack
+			// gateways with higher gateway-priorities. A dual-stack network should probably
+			// be preferred over two single-stack networks, if they all have equal priorities.
+			// It'd probably also be better to use a dual-stack endpoint as the gateway for
+			// a single address family, if there's a higher-priority single-stack gateway for
+			// the other address family. (But, priority is currently a Sandbox property, not
+			// an Endpoint property. So, this function doesn't have access to priorities.)
+			return ep, ep
+		}
+		if gw4 && ep4 == nil {
+			// Found the best IPv4-only gateway, keep searching for an IPv6 or dual-stack gateway.
+			ep4 = ep
+		}
+		if gw6 && ep6 == nil {
+			// Found the best IPv6-only gateway, keep searching for an IPv4 or dual-stack gateway.
+			ep6 = ep
 		}
 	}
-	return nil
+	return ep4, ep6
 }

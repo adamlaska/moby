@@ -3,8 +3,8 @@ package client // import "github.com/docker/docker/client"
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/url"
+	"strconv"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
@@ -13,22 +13,20 @@ import (
 
 // BuildCachePrune requests the daemon to delete unused cache data
 func (cli *Client) BuildCachePrune(ctx context.Context, opts types.BuildCachePruneOptions) (*types.BuildCachePruneReport, error) {
-	if err := cli.NewVersionError("1.31", "build prune"); err != nil {
+	if err := cli.NewVersionError(ctx, "1.31", "build prune"); err != nil {
 		return nil, err
 	}
-
-	report := types.BuildCachePruneReport{}
 
 	query := url.Values{}
 	if opts.All {
 		query.Set("all", "1")
 	}
-	query.Set("keep-storage", fmt.Sprintf("%d", opts.KeepStorage))
-	filters, err := filters.ToJSON(opts.Filters)
+	query.Set("keep-storage", strconv.Itoa(int(opts.KeepStorage)))
+	f, err := filters.ToJSON(opts.Filters)
 	if err != nil {
 		return nil, errors.Wrap(err, "prune could not marshal filters option")
 	}
-	query.Set("filters", filters)
+	query.Set("filters", f)
 
 	serverResp, err := cli.post(ctx, "/build/prune", query, nil, nil)
 	defer ensureReaderClosed(serverResp)
@@ -37,8 +35,9 @@ func (cli *Client) BuildCachePrune(ctx context.Context, opts types.BuildCachePru
 		return nil, err
 	}
 
+	report := types.BuildCachePruneReport{}
 	if err := json.NewDecoder(serverResp.body).Decode(&report); err != nil {
-		return nil, fmt.Errorf("Error retrieving disk usage: %v", err)
+		return nil, errors.Wrap(err, "error retrieving disk usage")
 	}
 
 	return &report, nil

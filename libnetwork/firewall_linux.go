@@ -1,44 +1,55 @@
 package libnetwork
 
 import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/iptables"
-	"github.com/sirupsen/logrus"
 )
 
 const userChain = "DOCKER-USER"
 
-var ctrl *controller
-
-func setupArrangeUserFilterRule(c *controller) {
-	ctrl = c
-	iptables.OnReloaded(arrangeUserFilterRule)
+// Sets up the DOCKER-USER chain for each iptables version (IPv4, IPv6) that's
+// enabled in the controller's configuration.
+func (c *Controller) setupUserChains() {
+	setup := func() error {
+		var errs []error
+		for _, ipVersion := range c.enabledIptablesVersions() {
+			errs = append(errs, setupUserChain(ipVersion))
+		}
+		return errors.Join(errs...)
+	}
+	if err := setup(); err != nil {
+		log.G(context.Background()).WithError(err).Warn("configuring " + userChain)
+	}
+	iptables.OnReloaded(func() {
+		if err := setup(); err != nil {
+			log.G(context.Background()).WithError(err).Warn("configuring " + userChain + " on firewall reload")
+		}
+	})
 }
 
-// This chain allow users to configure firewall policies in a way that persists
-// docker operations/restarts. Docker will not delete or modify any pre-existing
-// rules from the DOCKER-USER filter chain.
-// Note once DOCKER-USER chain is created, docker engine does not remove it when
-// IPTableForwarding is disabled, because it contains rules configured by user that
-// are beyond docker engine's control.
-func arrangeUserFilterRule() {
-	if ctrl == nil || !ctrl.iptablesEnabled() {
-		return
+// setupUserChain sets up the DOCKER-USER chain for the given [iptables.IPVersion].
+//
+// This chain allows users to configure firewall policies in a way that
+// persist daemon operations/restarts. The daemon does not delete or modify
+// any pre-existing rules from the DOCKER-USER filter chain.
+//
+// Once the DOCKER-USER chain is created, the daemon does not remove it when
+// IPTableForwarding is disabled, because it contains rules configured by user
+// that are beyond the daemon's control.
+func setupUserChain(ipVersion iptables.IPVersion) error {
+	ipt := iptables.GetIptable(ipVersion)
+	if _, err := ipt.NewChain(userChain, iptables.Filter); err != nil {
+		return fmt.Errorf("failed to create %s %v chain: %v", userChain, ipVersion, err)
 	}
-	// TODO IPv6 support
-	iptable := iptables.GetIptable(iptables.IPv4)
-	_, err := iptable.NewChain(userChain, iptables.Filter, false)
-	if err != nil {
-		logrus.Warnf("Failed to create %s chain: %v", userChain, err)
-		return
+	if err := ipt.AddReturnRule(userChain); err != nil {
+		return fmt.Errorf("failed to add the RETURN rule for %s %v: %w", userChain, ipVersion, err)
 	}
-
-	if err = iptable.AddReturnRule(userChain); err != nil {
-		logrus.Warnf("Failed to add the RETURN rule for %s: %v", userChain, err)
-		return
+	if err := ipt.EnsureJumpRule("FORWARD", userChain); err != nil {
+		return fmt.Errorf("failed to ensure the jump rule for %s %v: %w", userChain, ipVersion, err)
 	}
-
-	err = iptable.EnsureJumpRule("FORWARD", userChain)
-	if err != nil {
-		logrus.Warnf("Failed to ensure the jump rule for %s: %v", userChain, err)
-	}
+	return nil
 }

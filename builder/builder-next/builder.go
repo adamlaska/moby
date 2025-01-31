@@ -4,23 +4,30 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/platforms"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
+	timetypes "github.com/docker/docker/api/types/time"
 	"github.com/docker/docker/builder"
+	"github.com/docker/docker/builder/builder-next/exporter"
+	"github.com/docker/docker/builder/builder-next/exporter/mobyexporter"
+	"github.com/docker/docker/builder/builder-next/exporter/overrides"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/images"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libnetwork"
+	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/streamformatter"
-	"github.com/docker/go-units"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/control"
@@ -32,6 +39,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	grpcmetadata "google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 type errMultipleFilterValues struct{}
@@ -50,6 +58,12 @@ func (e errConflictFilter) Error() string {
 
 func (errConflictFilter) InvalidParameter() {}
 
+type errInvalidFilterValue struct {
+	error
+}
+
+func (errInvalidFilterValue) InvalidParameter() {}
+
 var cacheFields = map[string]bool{
 	"id":          true,
 	"parent":      true,
@@ -67,8 +81,10 @@ var cacheFields = map[string]bool{
 type Opt struct {
 	SessionManager      *session.Manager
 	Root                string
+	EngineID            string
 	Dist                images.DistributionServices
-	NetworkController   libnetwork.NetworkController
+	ImageTagger         mobyexporter.ImageTagger
+	NetworkController   *libnetwork.Controller
 	DefaultCgroupParent string
 	RegistryHosts       docker.RegistryHosts
 	BuilderConfig       config.BuilderConfig
@@ -76,31 +92,44 @@ type Opt struct {
 	IdentityMapping     idtools.IdentityMapping
 	DNSConfig           config.DNSConfig
 	ApparmorProfile     string
+	UseSnapshotter      bool
+	Snapshotter         string
+	ContainerdAddress   string
+	ContainerdNamespace string
+	Callbacks           exporter.BuildkitCallbacks
 }
 
 // Builder can build using BuildKit backend
 type Builder struct {
 	controller     *control.Controller
+	dnsconfig      config.DNSConfig
 	reqBodyHandler *reqBodyHandler
 
-	mu   sync.Mutex
-	jobs map[string]*buildJob
+	mu             sync.Mutex
+	jobs           map[string]*buildJob
+	useSnapshotter bool
 }
 
 // New creates a new builder
-func New(opt Opt) (*Builder, error) {
+func New(ctx context.Context, opt Opt) (*Builder, error) {
 	reqHandler := newReqBodyHandler(tracing.DefaultTransport)
 
-	c, err := newController(reqHandler, opt)
+	c, err := newController(ctx, reqHandler, opt)
 	if err != nil {
 		return nil, err
 	}
 	b := &Builder{
 		controller:     c,
+		dnsconfig:      opt.DNSConfig,
 		reqBodyHandler: reqHandler,
 		jobs:           map[string]*buildJob{},
+		useSnapshotter: opt.UseSnapshotter,
 	}
 	return b, nil
+}
+
+func (b *Builder) Close() error {
+	return b.controller.Close()
 }
 
 // RegisterGRPC registers controller to the grpc server.
@@ -135,16 +164,29 @@ func (b *Builder) DiskUsage(ctx context.Context) ([]*types.BuildCache, error) {
 			Description: r.Description,
 			InUse:       r.InUse,
 			Shared:      r.Shared,
-			Size:        r.Size_,
-			CreatedAt:   r.CreatedAt,
-			LastUsedAt:  r.LastUsedAt,
-			UsageCount:  int(r.UsageCount),
+			Size:        r.Size,
+			CreatedAt: func() time.Time {
+				if r.CreatedAt != nil {
+					return r.CreatedAt.AsTime()
+				}
+				return time.Time{}
+			}(),
+			LastUsedAt: func() *time.Time {
+				if r.LastUsedAt == nil {
+					return nil
+				}
+				t := r.LastUsedAt.AsTime()
+				return &t
+			}(),
+			UsageCount: int(r.UsageCount),
 		})
 	}
 	return items, nil
 }
 
-// Prune clears all reclaimable build cache
+// Prune clears all reclaimable build cache.
+//
+// FIXME(thaJeztah): wire up new options https://github.com/moby/moby/issues/48639
 func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) (int64, []string, error) {
 	ch := make(chan *controlapi.UsageRecord)
 
@@ -170,10 +212,10 @@ func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) 
 	eg.Go(func() error {
 		defer close(ch)
 		return b.controller.Prune(&controlapi.PruneRequest{
-			All:          pi.All,
-			KeepDuration: int64(pi.KeepDuration),
-			KeepBytes:    pi.KeepBytes,
-			Filter:       pi.Filter,
+			All:           pi.All,
+			KeepDuration:  int64(pi.KeepDuration),
+			ReservedSpace: pi.ReservedSpace,
+			Filter:        pi.Filter,
 		}, &pruneProxy{
 			streamProxy: streamProxy{ctx: ctx},
 			ch:          ch,
@@ -184,7 +226,7 @@ func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) 
 	var cacheIDs []string
 	eg.Go(func() error {
 		for r := range ch {
-			size += r.Size_
+			size += r.Size
 			cacheIDs = append(cacheIDs, r.ID)
 		}
 		return nil
@@ -199,8 +241,11 @@ func (b *Builder) Prune(ctx context.Context, opts types.BuildCachePruneOptions) 
 
 // Build executes a build request
 func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.Result, error) {
-	var rc = opt.Source
+	if len(opt.Options.Outputs) > 1 {
+		return nil, errors.Errorf("multiple outputs not supported")
+	}
 
+	rc := opt.Source
 	if buildID := opt.Options.BuildID; buildID != "" {
 		b.mu.Lock()
 
@@ -245,8 +290,6 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 	}
 
 	var out builder.Result
-
-	id := identity.NewID()
 
 	frontendAttrs := map[string]string{}
 
@@ -298,20 +341,20 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		// TODO: remove once opt.Options.Platform is of type specs.Platform
 		_, err := platforms.Parse(opt.Options.Platform)
 		if err != nil {
-			return nil, err
+			return nil, errdefs.InvalidParameter(err)
 		}
 		frontendAttrs["platform"] = opt.Options.Platform
 	}
 
 	switch opt.Options.NetworkMode {
-	case "host", "none":
+	case network.NetworkHost, network.NetworkNone:
 		frontendAttrs["force-network-mode"] = opt.Options.NetworkMode
-	case "", "default":
+	case "", network.NetworkDefault:
 	default:
 		return nil, errors.Errorf("network mode %q not supported by buildkit", opt.Options.NetworkMode)
 	}
 
-	extraHosts, err := toBuildkitExtraHosts(opt.Options.ExtraHosts)
+	extraHosts, err := toBuildkitExtraHosts(opt.Options.ExtraHosts, b.dnsconfig.HostGatewayIPs)
 	if err != nil {
 		return nil, err
 	}
@@ -330,11 +373,8 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 
 	exporterName := ""
 	exporterAttrs := map[string]string{}
-
-	if len(opt.Options.Outputs) > 1 {
-		return nil, errors.Errorf("multiple outputs not supported")
-	} else if len(opt.Options.Outputs) == 0 {
-		exporterName = "moby"
+	if len(opt.Options.Outputs) == 0 {
+		exporterName = exporter.Moby
 	} else {
 		// cacheonly is a special type for triggering skipping all exporters
 		if opt.Options.Outputs[0].Type != "cacheonly" {
@@ -343,14 +383,18 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		}
 	}
 
-	if exporterName == "moby" {
-		if len(opt.Options.Tags) > 0 {
-			exporterAttrs["name"] = strings.Join(opt.Options.Tags, ",")
+	if (exporterName == client.ExporterImage || exporterName == exporter.Moby) && len(opt.Options.Tags) > 0 {
+		nameAttr, err := overrides.SanitizeRepoAndTags(opt.Options.Tags)
+		if err != nil {
+			return nil, err
 		}
+		if exporterAttrs == nil {
+			exporterAttrs = make(map[string]string)
+		}
+		exporterAttrs["name"] = strings.Join(nameAttr, ",")
 	}
 
-	cache := controlapi.CacheOptions{}
-
+	cache := &controlapi.CacheOptions{}
 	if inlineCache := opt.Options.BuildArgs["BUILDKIT_INLINE_CACHE"]; inlineCache != nil {
 		if b, err := strconv.ParseBool(*inlineCache); err == nil && b {
 			cache.Exports = append(cache.Exports, &controlapi.CacheOptionsEntry{
@@ -359,18 +403,20 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		}
 	}
 
+	id := identity.NewID()
 	req := &controlapi.SolveRequest{
-		Ref:           id,
-		Exporter:      exporterName,
-		ExporterAttrs: exporterAttrs,
+		Ref: id,
+		Exporters: []*controlapi.Exporter{
+			{Type: exporterName, Attrs: exporterAttrs},
+		},
 		Frontend:      "dockerfile.v0",
 		FrontendAttrs: frontendAttrs,
 		Session:       opt.Options.SessionID,
 		Cache:         cache,
 	}
 
-	if opt.Options.NetworkMode == "host" {
-		req.Entitlements = append(req.Entitlements, entitlements.EntitlementNetworkHost)
+	if opt.Options.NetworkMode == network.NetworkHost {
+		req.Entitlements = append(req.Entitlements, string(entitlements.EntitlementNetworkHost))
 	}
 
 	aux := streamformatter.AuxFormatter{Writer: opt.ProgressWriter.Output}
@@ -382,15 +428,15 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		if err != nil {
 			return err
 		}
-		if exporterName != "moby" {
+		if exporterName != exporter.Moby && exporterName != client.ExporterImage {
 			return nil
 		}
-		id, ok := resp.ExporterResponse["containerimage.digest"]
+		imgID, ok := resp.ExporterResponse["containerimage.digest"]
 		if !ok {
 			return errors.Errorf("missing image id")
 		}
-		out.ImageID = id
-		return aux.Emit("moby.image.id", types.BuildResult{ID: id})
+		out.ImageID = imgID
+		return aux.Emit("moby.image.id", types.BuildResult{ID: imgID})
 	})
 
 	ch := make(chan *controlapi.StatusResponse)
@@ -405,7 +451,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 
 	eg.Go(func() error {
 		for sr := range ch {
-			dt, err := sr.Marshal()
+			dt, err := proto.Marshal(sr)
 			if err != nil {
 				return err
 			}
@@ -441,6 +487,7 @@ func (sp *streamProxy) SetTrailer(_ grpcmetadata.MD) {
 func (sp *streamProxy) Context() context.Context {
 	return sp.ctx
 }
+
 func (sp *streamProxy) RecvMsg(m interface{}) error {
 	return io.EOF
 }
@@ -453,6 +500,7 @@ type statusProxy struct {
 func (sp *statusProxy) Send(resp *controlapi.StatusResponse) error {
 	return sp.SendMsg(resp)
 }
+
 func (sp *statusProxy) SendMsg(m interface{}) error {
 	if sr, ok := m.(*controlapi.StatusResponse); ok {
 		sp.ch <- sr
@@ -468,6 +516,7 @@ type pruneProxy struct {
 func (sp *pruneProxy) Send(resp *controlapi.UsageRecord) error {
 	return sp.SendMsg(resp)
 }
+
 func (sp *pruneProxy) SendMsg(m interface{}) error {
 	if sr, ok := m.(*controlapi.UsageRecord); ok {
 		sp.ch <- sr
@@ -551,24 +600,34 @@ func (j *buildJob) SetUpload(ctx context.Context, rc io.ReadCloser) error {
 }
 
 // toBuildkitExtraHosts converts hosts from docker key:value format to buildkit's csv format
-func toBuildkitExtraHosts(inp []string) (string, error) {
+func toBuildkitExtraHosts(inp []string, hostGatewayIPs []netip.Addr) (string, error) {
 	if len(inp) == 0 {
 		return "", nil
 	}
 	hosts := make([]string, 0, len(inp))
 	for _, h := range inp {
-		parts := strings.Split(h, ":")
-
-		if len(parts) != 2 || parts[0] == "" || net.ParseIP(parts[1]) == nil {
+		host, ip, ok := strings.Cut(h, ":")
+		if !ok || host == "" || ip == "" {
 			return "", errors.Errorf("invalid host %s", h)
 		}
-		hosts = append(hosts, parts[0]+"="+parts[1])
+		// If the IP Address is a "host-gateway", replace this value with the
+		// IP address(es) stored in the daemon level HostGatewayIPs config variable.
+		if ip == opts.HostGatewayName {
+			if len(hostGatewayIPs) == 0 {
+				return "", fmt.Errorf("unable to derive the IP value for host-gateway")
+			}
+			for _, gip := range hostGatewayIPs {
+				hosts = append(hosts, host+"="+gip.String())
+			}
+		} else {
+			hosts = append(hosts, host+"="+ip)
+		}
 	}
 	return strings.Join(hosts, ","), nil
 }
 
 // toBuildkitUlimits converts ulimits from docker type=soft:hard format to buildkit's csv format
-func toBuildkitUlimits(inp []*units.Ulimit) (string, error) {
+func toBuildkitUlimits(inp []*container.Ulimit) (string, error) {
 	if len(inp) == 0 {
 		return "", nil
 	}
@@ -579,6 +638,7 @@ func toBuildkitUlimits(inp []*units.Ulimit) (string, error) {
 	return strings.Join(ulimits, ","), nil
 }
 
+// FIXME(thaJeztah): wire-up new fields; see https://github.com/moby/moby/issues/48639
 func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, error) {
 	var until time.Duration
 	untilValues := opts.Filters.Get("until")          // canonical
@@ -597,11 +657,20 @@ func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, e
 	case 0:
 		// nothing to do
 	case 1:
-		var err error
-		until, err = time.ParseDuration(untilValues[0])
+		ts, err := timetypes.GetTimestamp(untilValues[0], time.Now())
 		if err != nil {
-			return client.PruneInfo{}, errors.Wrapf(err, "%q filter expects a duration (e.g., '24h')", filterKey)
+			return client.PruneInfo{}, errInvalidFilterValue{
+				errors.Wrapf(err, "%q filter expects a duration (e.g., '24h') or a timestamp", filterKey),
+			}
 		}
+		seconds, nanoseconds, err := timetypes.ParseTimestamps(ts, 0)
+		if err != nil {
+			return client.PruneInfo{}, errInvalidFilterValue{
+				errors.Wrapf(err, "failed to parse timestamp %q", ts),
+			}
+		}
+
+		until = time.Since(time.Unix(seconds, nanoseconds))
 	default:
 		return client.PruneInfo{}, errMultipleFilterValues{}
 	}
@@ -625,9 +694,9 @@ func toBuildkitPruneInfo(opts types.BuildCachePruneOptions) (client.PruneInfo, e
 		}
 	}
 	return client.PruneInfo{
-		All:          opts.All,
-		KeepDuration: until,
-		KeepBytes:    opts.KeepStorage,
-		Filter:       []string{strings.Join(bkFilter, ",")},
+		All:           opts.All,
+		KeepDuration:  until,
+		ReservedSpace: opts.KeepStorage,
+		Filter:        []string{strings.Join(bkFilter, ",")},
 	}, nil
 }

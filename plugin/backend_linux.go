@@ -14,30 +14,32 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
+	"github.com/distribution/reference"
 	"github.com/docker/distribution/manifest/schema2"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/internal/containerfs"
 	"github.com/docker/docker/pkg/authorization"
 	"github.com/docker/docker/pkg/chrootarchive"
-	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/stringid"
 	v2 "github.com/docker/docker/plugin/v2"
 	"github.com/moby/sys/mount"
 	"github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 )
 
 var acceptedPluginFilterTags = map[string]bool{
@@ -46,7 +48,7 @@ var acceptedPluginFilterTags = map[string]bool{
 }
 
 // Disable deactivates a plugin. This means resources (volumes, networks) cant use them.
-func (pm *Manager) Disable(refOrID string, config *types.PluginDisableConfig) error {
+func (pm *Manager) Disable(refOrID string, config *backend.PluginDisableConfig) error {
 	p, err := pm.config.Store.GetV2Plugin(refOrID)
 	if err != nil {
 		return err
@@ -69,12 +71,12 @@ func (pm *Manager) Disable(refOrID string, config *types.PluginDisableConfig) er
 		return err
 	}
 	pm.publisher.Publish(EventDisable{Plugin: p.PluginObj})
-	pm.config.LogPluginEvent(p.GetID(), refOrID, "disable")
+	pm.config.LogPluginEvent(p.GetID(), refOrID, events.ActionDisable)
 	return nil
 }
 
 // Enable activates a plugin, which implies that they are ready to be used by containers.
-func (pm *Manager) Enable(refOrID string, config *types.PluginEnableConfig) error {
+func (pm *Manager) Enable(refOrID string, config *backend.PluginEnableConfig) error {
 	p, err := pm.config.Store.GetV2Plugin(refOrID)
 	if err != nil {
 		return err
@@ -85,7 +87,7 @@ func (pm *Manager) Enable(refOrID string, config *types.PluginEnableConfig) erro
 		return err
 	}
 	pm.publisher.Publish(EventEnable{Plugin: p.PluginObj})
-	pm.config.LogPluginEvent(p.GetID(), refOrID, "enable")
+	pm.config.LogPluginEvent(p.GetID(), refOrID, events.ActionEnable)
 	return nil
 }
 
@@ -165,19 +167,19 @@ func (pm *Manager) Privileges(ctx context.Context, ref reference.Named, metaHead
 		configSeen bool
 	)
 
-	h := func(ctx context.Context, desc specs.Descriptor) ([]specs.Descriptor, error) {
+	h := func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 		switch desc.MediaType {
-		case schema2.MediaTypeManifest, specs.MediaTypeImageManifest:
+		case schema2.MediaTypeManifest, ocispec.MediaTypeImageManifest:
 			data, err := content.ReadBlob(ctx, pm.blobStore, desc)
 			if err != nil {
 				return nil, errors.Wrapf(err, "error reading image manifest from blob store for %s", ref)
 			}
 
-			var m specs.Manifest
+			var m ocispec.Manifest
 			if err := json.Unmarshal(data, &m); err != nil {
 				return nil, errors.Wrapf(err, "error unmarshaling image manifest for %s", ref)
 			}
-			return []specs.Descriptor{m.Config}, nil
+			return []ocispec.Descriptor{m.Config}, nil
 		case schema2.MediaTypePluginConfig:
 			configSeen = true
 			data, err := content.ReadBlob(ctx, pm.blobStore, desc)
@@ -193,7 +195,7 @@ func (pm *Manager) Privileges(ctx context.Context, ref reference.Named, metaHead
 		return nil, nil
 	}
 
-	if err := pm.fetch(ctx, ref, authConfig, progress.DiscardOutput(), metaHeader, images.HandlerFunc(h)); err != nil {
+	if err := pm.fetch(ctx, ref, authConfig, progress.DiscardOutput(), metaHeader, c8dimages.HandlerFunc(h)); err != nil {
 		return types.PluginPrivileges{}, nil
 	}
 
@@ -239,7 +241,7 @@ func (pm *Manager) Upgrade(ctx context.Context, ref reference.Named, name string
 	if err := pm.fetch(ctx, ref, authConfig, out, metaHeader, storeFetchMetadata(&md), childrenHandler(pm.blobStore), applyLayer(pm.blobStore, tmpRootFSDir, out)); err != nil {
 		return err
 	}
-	pm.config.LogPluginEvent(reference.FamiliarString(ref), name, "pull")
+	pm.config.LogPluginEvent(reference.FamiliarString(ref), name, events.ActionPull)
 
 	if err := validateFetchedMetadata(md); err != nil {
 		return err
@@ -285,7 +287,7 @@ func (pm *Manager) Pull(ctx context.Context, ref reference.Named, name string, m
 	if err := pm.fetch(ctx, ref, authConfig, out, metaHeader, storeFetchMetadata(&md), childrenHandler(pm.blobStore), applyLayer(pm.blobStore, tmpRootFSDir, out)); err != nil {
 		return err
 	}
-	pm.config.LogPluginEvent(reference.FamiliarString(ref), name, "pull")
+	pm.config.LogPluginEvent(reference.FamiliarString(ref), name, events.ActionPull)
 
 	if err := validateFetchedMetadata(md); err != nil {
 		return err
@@ -318,12 +320,15 @@ func (pm *Manager) List(pluginFilters filters.Args) ([]types.Plugin, error) {
 	enabledOnly := false
 	disabledOnly := false
 	if pluginFilters.Contains("enabled") {
-		if pluginFilters.ExactMatch("enabled", "true") {
+		enabledFilter, err := pluginFilters.GetBoolOrDefault("enabled", false)
+		if err != nil {
+			return nil, err
+		}
+
+		if enabledFilter {
 			enabledOnly = true
-		} else if pluginFilters.ExactMatch("enabled", "false") {
-			disabledOnly = true
 		} else {
-			return nil, invalidFilter{"enabled", pluginFilters.Get("enabled")}
+			disabledOnly = true
 		}
 	}
 
@@ -371,7 +376,6 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 
 	pusher, err := resolver.Pusher(ctx, ref.String())
 	if err != nil {
-
 		return errors.Wrap(err, "error creating plugin pusher")
 	}
 
@@ -381,8 +385,8 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 	out, waitProgress := setupProgressOutput(outStream, cancel)
 	defer waitProgress()
 
-	progressHandler := images.HandlerFunc(func(ctx context.Context, desc specs.Descriptor) ([]specs.Descriptor, error) {
-		logrus.WithField("mediaType", desc.MediaType).WithField("digest", desc.Digest.String()).Debug("Preparing to push plugin layer")
+	progressHandler := c8dimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		log.G(ctx).WithField("mediaType", desc.MediaType).WithField("digest", desc.Digest.String()).Debug("Preparing to push plugin layer")
 		id := stringid.TruncateID(desc.Digest.String())
 		pj.add(remotes.MakeRefKey(ctx, desc), id)
 		progress.Update(out, id, "Preparing")
@@ -421,8 +425,8 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 
 	// Make sure we can authenticate the request since the auth scope for plugin repos is different than a normal repo.
 	ctx = docker.WithScope(ctx, scope(ref, true))
-	if err := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, nil, func(h images.Handler) images.Handler {
-		return images.Handlers(progressHandler, h)
+	if err := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, nil, func(h c8dimages.Handler) c8dimages.Handler {
+		return c8dimages.Handlers(progressHandler, h)
 	}); err != nil {
 		// Try fallback to http.
 		// This is needed because the containerd pusher will only attempt the first registry config we pass, which would
@@ -432,14 +436,14 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 		if resolver != nil {
 			pusher, _ := resolver.Pusher(ctx, ref.String())
 			if pusher != nil {
-				logrus.WithField("ref", ref).Debug("Re-attmpting push with http-fallback")
-				err2 := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, nil, func(h images.Handler) images.Handler {
-					return images.Handlers(progressHandler, h)
+				log.G(ctx).WithField("ref", ref).Debug("Re-attmpting push with http-fallback")
+				err2 := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, nil, func(h c8dimages.Handler) c8dimages.Handler {
+					return c8dimages.Handlers(progressHandler, h)
 				})
 				if err2 == nil {
 					err = nil
 				} else {
-					logrus.WithError(err2).WithField("ref", ref).Debug("Error while attempting push with http-fallback")
+					log.G(ctx).WithError(err2).WithField("ref", ref).Debug("Error while attempting push with http-fallback")
 				}
 			}
 		}
@@ -467,20 +471,20 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 // even though this is set on the descriptor
 // The OCI types do not have this field.
 type manifest struct {
-	specs.Manifest
+	ocispec.Manifest
 	MediaType string `json:"mediaType,omitempty"`
 }
 
 func buildManifest(ctx context.Context, s content.Manager, config digest.Digest, layers []digest.Digest) (manifest, error) {
 	var m manifest
-	m.MediaType = images.MediaTypeDockerSchema2Manifest
+	m.MediaType = c8dimages.MediaTypeDockerSchema2Manifest
 	m.SchemaVersion = 2
 
 	configInfo, err := s.Info(ctx, config)
 	if err != nil {
 		return m, errors.Wrapf(err, "error reading plugin config content for digest %s", config)
 	}
-	m.Config = specs.Descriptor{
+	m.Config = ocispec.Descriptor{
 		MediaType: mediaTypePluginConfig,
 		Size:      configInfo.Size,
 		Digest:    configInfo.Digest,
@@ -491,8 +495,8 @@ func buildManifest(ctx context.Context, s content.Manager, config digest.Digest,
 		if err != nil {
 			return m, errors.Wrapf(err, "error fetching info for content digest %s", l)
 		}
-		m.Layers = append(m.Layers, specs.Descriptor{
-			MediaType: images.MediaTypeDockerSchema2LayerGzip, // TODO: This is assuming everything is a gzip compressed layer, but that may not be true.
+		m.Layers = append(m.Layers, ocispec.Descriptor{
+			MediaType: c8dimages.MediaTypeDockerSchema2LayerGzip, // TODO: This is assuming everything is a gzip compressed layer, but that may not be true.
 			Digest:    l,
 			Size:      info.Size,
 		})
@@ -502,15 +506,15 @@ func buildManifest(ctx context.Context, s content.Manager, config digest.Digest,
 
 // getManifestDescriptor gets the OCI descriptor for a manifest
 // It will generate a manifest if one does not exist
-func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (specs.Descriptor, error) {
-	logger := logrus.WithField("plugin", p.Name()).WithField("digest", p.Manifest)
+func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (ocispec.Descriptor, error) {
+	logger := log.G(ctx).WithField("plugin", p.Name()).WithField("digest", p.Manifest)
 	if p.Manifest != "" {
 		info, err := pm.blobStore.Info(ctx, p.Manifest)
 		if err == nil {
-			desc := specs.Descriptor{
+			desc := ocispec.Descriptor{
 				Size:      info.Size,
 				Digest:    info.Digest,
-				MediaType: images.MediaTypeDockerSchema2Manifest,
+				MediaType: c8dimages.MediaTypeDockerSchema2Manifest,
 			}
 			return desc, nil
 		}
@@ -520,12 +524,12 @@ func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (spe
 	}
 	logger.Info("Building a new plugin manifest")
 
-	manifest, err := buildManifest(ctx, pm.blobStore, p.Config, p.Blobsums)
+	mfst, err := buildManifest(ctx, pm.blobStore, p.Config, p.Blobsums)
 	if err != nil {
-		return specs.Descriptor{}, err
+		return ocispec.Descriptor{}, err
 	}
 
-	desc, err := writeManifest(ctx, pm.blobStore, &manifest)
+	desc, err := writeManifest(ctx, pm.blobStore, &mfst)
 	if err != nil {
 		return desc, err
 	}
@@ -536,10 +540,10 @@ func (pm *Manager) getManifestDescriptor(ctx context.Context, p *v2.Plugin) (spe
 	return desc, nil
 }
 
-func writeManifest(ctx context.Context, cs content.Store, m *manifest) (specs.Descriptor, error) {
+func writeManifest(ctx context.Context, cs content.Store, m *manifest) (ocispec.Descriptor, error) {
 	platform := platforms.DefaultSpec()
-	desc := specs.Descriptor{
-		MediaType: images.MediaTypeDockerSchema2Manifest,
+	desc := ocispec.Descriptor{
+		MediaType: c8dimages.MediaTypeDockerSchema2Manifest,
 		Platform:  &platform,
 	}
 	data, err := json.Marshal(m)
@@ -556,7 +560,7 @@ func writeManifest(ctx context.Context, cs content.Store, m *manifest) (specs.De
 }
 
 // Remove deletes plugin's root directory.
-func (pm *Manager) Remove(name string, config *types.PluginRmConfig) error {
+func (pm *Manager) Remove(name string, config *backend.PluginRmConfig) error {
 	p, err := pm.config.Store.GetV2Plugin(name)
 	pm.mu.RLock()
 	c := pm.cMap[p]
@@ -577,7 +581,7 @@ func (pm *Manager) Remove(name string, config *types.PluginRmConfig) error {
 
 	if p.IsEnabled() {
 		if err := pm.disable(p, c); err != nil {
-			logrus.Errorf("failed to disable plugin '%s': %s", p.Name(), err)
+			log.G(context.TODO()).Errorf("failed to disable plugin '%s': %s", p.Name(), err)
 		}
 	}
 
@@ -597,7 +601,7 @@ func (pm *Manager) Remove(name string, config *types.PluginRmConfig) error {
 	}
 
 	pm.config.Store.Remove(p)
-	pm.config.LogPluginEvent(id, name, "remove")
+	pm.config.LogPluginEvent(id, name, events.ActionRemove)
 	pm.publisher.Publish(EventRemove{Plugin: p.PluginObj})
 	return nil
 }
@@ -725,7 +729,7 @@ func (pm *Manager) CreateFromContext(ctx context.Context, tarCtx io.ReadCloser, 
 	p.PluginObj.PluginReference = name
 
 	pm.publisher.Publish(EventCreate{Plugin: p.PluginObj})
-	pm.config.LogPluginEvent(p.PluginObj.ID, name, "create")
+	pm.config.LogPluginEvent(p.PluginObj.ID, name, events.ActionCreate)
 
 	return nil
 }

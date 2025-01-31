@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package seccomp // import "github.com/docker/docker/profiles/seccomp"
 
@@ -40,7 +39,6 @@ func TestLoadProfile(t *testing.T) {
 				}},
 			},
 			{
-
 				Names:  []string{"open"},
 				Action: specs.ActAllow,
 				Args:   []specs.LinuxSeccompArg{},
@@ -63,7 +61,7 @@ func TestLoadProfile(t *testing.T) {
 }
 
 func TestLoadProfileWithDefaultErrnoRet(t *testing.T) {
-	var profile = []byte(`{
+	profile := []byte(`{
 "defaultAction": "SCMP_ACT_ERRNO",
 "defaultErrnoRet": 6
 }`)
@@ -83,7 +81,7 @@ func TestLoadProfileWithDefaultErrnoRet(t *testing.T) {
 }
 
 func TestLoadProfileWithListenerPath(t *testing.T) {
-	var profile = []byte(`{
+	profile := []byte(`{
 "defaultAction": "SCMP_ACT_ERRNO",
 "listenerPath": "/var/run/seccompaget.sock",
 "listenerMetadata": "opaque-metadata"
@@ -134,7 +132,6 @@ func TestLoadProfileValidation(t *testing.T) {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		rs := createSpec()
 		t.Run(tc.doc, func(t *testing.T) {
 			_, err := LoadProfile(tc.profile, &rs)
@@ -222,7 +219,6 @@ func TestMarshalUnmarshalFilter(t *testing.T) {
 		{in: `{"arches":["s390x"],"minKernel":"4.15"}`, out: `{"arches":["s390x"],"minKernel":"4.15"}`},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.in, func(t *testing.T) {
 			var filter Filter
 			err := json.Unmarshal([]byte(tc.in), &filter)
@@ -264,7 +260,6 @@ func TestLoadConditional(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			rs := createSpec(tc.cap)
 			p, err := LoadProfile(string(f), &rs)

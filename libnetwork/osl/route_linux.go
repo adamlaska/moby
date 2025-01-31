@@ -1,30 +1,39 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.22 && (linux || freebsd)
+
 package osl
 
 import (
 	"fmt"
 	"net"
+	"slices"
 
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/vishvananda/netlink"
 )
 
-func (n *networkNamespace) Gateway() net.IP {
-	n.Lock()
-	defer n.Unlock()
+// Gateway returns the IPv4 gateway for the sandbox.
+func (n *Namespace) Gateway() net.IP {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
 	return n.gw
 }
 
-func (n *networkNamespace) GatewayIPv6() net.IP {
-	n.Lock()
-	defer n.Unlock()
+// GatewayIPv6 returns the IPv6 gateway for the sandbox.
+func (n *Namespace) GatewayIPv6() net.IP {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
 	return n.gwv6
 }
 
-func (n *networkNamespace) StaticRoutes() []*types.StaticRoute {
-	n.Lock()
-	defer n.Unlock()
+// StaticRoutes returns additional static routes for the sandbox. Note that
+// directly connected routes are stored on the particular interface they
+// refer to.
+func (n *Namespace) StaticRoutes() []*types.StaticRoute {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
 	routes := make([]*types.StaticRoute, len(n.staticRoutes))
 	for i, route := range n.staticRoutes {
@@ -35,49 +44,40 @@ func (n *networkNamespace) StaticRoutes() []*types.StaticRoute {
 	return routes
 }
 
-func (n *networkNamespace) setGateway(gw net.IP) {
-	n.Lock()
+// SetGateway sets the default IPv4 gateway for the sandbox. It is a no-op
+// if the given gateway is empty.
+func (n *Namespace) SetGateway(gw net.IP) error {
+	if len(gw) == 0 {
+		return nil
+	}
+
+	if err := n.programGateway(gw, true); err != nil {
+		return err
+	}
+	n.mu.Lock()
 	n.gw = gw
-	n.Unlock()
+	n.mu.Unlock()
+	return nil
 }
 
-func (n *networkNamespace) setGatewayIPv6(gwv6 net.IP) {
-	n.Lock()
-	n.gwv6 = gwv6
-	n.Unlock()
-}
-
-func (n *networkNamespace) SetGateway(gw net.IP) error {
-	// Silently return if the gateway is empty
-	if len(gw) == 0 {
-		return nil
-	}
-
-	err := n.programGateway(gw, true)
-	if err == nil {
-		n.setGateway(gw)
-	}
-
-	return err
-}
-
-func (n *networkNamespace) UnsetGateway() error {
+// UnsetGateway the previously set default IPv4 gateway in the sandbox.
+// It is a no-op if no gateway was set.
+func (n *Namespace) UnsetGateway() error {
 	gw := n.Gateway()
-
-	// Silently return if the gateway is empty
 	if len(gw) == 0 {
 		return nil
 	}
 
-	err := n.programGateway(gw, false)
-	if err == nil {
-		n.setGateway(net.IP{})
+	if err := n.programGateway(gw, false); err != nil {
+		return err
 	}
-
-	return err
+	n.mu.Lock()
+	n.gw = net.IP{}
+	n.mu.Unlock()
+	return nil
 }
 
-func (n *networkNamespace) programGateway(gw net.IP, isAdd bool) error {
+func (n *Namespace) programGateway(gw net.IP, isAdd bool) error {
 	gwRoutes, err := n.nlHandle.RouteGet(gw)
 	if err != nil {
 		return fmt.Errorf("route for the gateway %s could not be found: %v", gw, err)
@@ -92,7 +92,7 @@ func (n *networkNamespace) programGateway(gw net.IP, isAdd bool) error {
 	}
 
 	if linkIndex == 0 {
-		return fmt.Errorf("Direct route for the gateway %s could not be found", gw)
+		return fmt.Errorf("direct route for the gateway %s could not be found", gw)
 	}
 
 	if isAdd {
@@ -111,7 +111,7 @@ func (n *networkNamespace) programGateway(gw net.IP, isAdd bool) error {
 }
 
 // Program a route in to the namespace routing table.
-func (n *networkNamespace) programRoute(path string, dest *net.IPNet, nh net.IP) error {
+func (n *Namespace) programRoute(dest *net.IPNet, nh net.IP) error {
 	gwRoutes, err := n.nlHandle.RouteGet(nh)
 	if err != nil {
 		return fmt.Errorf("route for the next hop %s could not be found: %v", nh, err)
@@ -126,7 +126,7 @@ func (n *networkNamespace) programRoute(path string, dest *net.IPNet, nh net.IP)
 }
 
 // Delete a route from the namespace routing table.
-func (n *networkNamespace) removeRoute(path string, dest *net.IPNet, nh net.IP) error {
+func (n *Namespace) removeRoute(dest *net.IPNet, nh net.IP) error {
 	gwRoutes, err := n.nlHandle.RouteGet(nh)
 	if err != nil {
 		return fmt.Errorf("route for the next hop could not be found: %v", err)
@@ -140,64 +140,193 @@ func (n *networkNamespace) removeRoute(path string, dest *net.IPNet, nh net.IP) 
 	})
 }
 
-func (n *networkNamespace) SetGatewayIPv6(gwv6 net.IP) error {
-	// Silently return if the gateway is empty
+// SetGatewayIPv6 sets the default IPv6 gateway for the sandbox. It is a no-op
+// if the given gateway is empty.
+func (n *Namespace) SetGatewayIPv6(gwv6 net.IP) error {
 	if len(gwv6) == 0 {
 		return nil
 	}
 
-	err := n.programGateway(gwv6, true)
-	if err == nil {
-		n.setGatewayIPv6(gwv6)
+	if err := n.programGateway(gwv6, true); err != nil {
+		return err
 	}
 
-	return err
+	n.mu.Lock()
+	n.gwv6 = gwv6
+	n.mu.Unlock()
+	return nil
 }
 
-func (n *networkNamespace) UnsetGatewayIPv6() error {
+// UnsetGatewayIPv6 unsets the previously set default IPv6 gateway in the sandbox.
+// It is a no-op if no gateway was set.
+func (n *Namespace) UnsetGatewayIPv6() error {
 	gwv6 := n.GatewayIPv6()
-
-	// Silently return if the gateway is empty
 	if len(gwv6) == 0 {
 		return nil
 	}
 
-	err := n.programGateway(gwv6, false)
-	if err == nil {
-		n.Lock()
-		n.gwv6 = net.IP{}
-		n.Unlock()
+	if err := n.programGateway(gwv6, false); err != nil {
+		return err
 	}
 
-	return err
+	n.mu.Lock()
+	n.gwv6 = net.IP{}
+	n.mu.Unlock()
+	return nil
 }
 
-func (n *networkNamespace) AddStaticRoute(r *types.StaticRoute) error {
-	err := n.programRoute(n.nsPath(), r.Destination, r.NextHop)
-	if err == nil {
-		n.Lock()
-		n.staticRoutes = append(n.staticRoutes, r)
-		n.Unlock()
+// AddStaticRoute adds a static route to the sandbox.
+func (n *Namespace) AddStaticRoute(r *types.StaticRoute) error {
+	if err := n.programRoute(r.Destination, r.NextHop); err != nil {
+		return err
 	}
-	return err
+
+	n.mu.Lock()
+	n.staticRoutes = append(n.staticRoutes, r)
+	n.mu.Unlock()
+	return nil
 }
 
-func (n *networkNamespace) RemoveStaticRoute(r *types.StaticRoute) error {
+// RemoveStaticRoute removes a static route from the sandbox.
+func (n *Namespace) RemoveStaticRoute(r *types.StaticRoute) error {
+	if err := n.removeRoute(r.Destination, r.NextHop); err != nil {
+		return err
+	}
 
-	err := n.removeRoute(n.nsPath(), r.Destination, r.NextHop)
-	if err == nil {
-		n.Lock()
-		lastIndex := len(n.staticRoutes) - 1
-		for i, v := range n.staticRoutes {
-			if v == r {
-				// Overwrite the route we're removing with the last element
-				n.staticRoutes[i] = n.staticRoutes[lastIndex]
-				// Shorten the slice to trim the extra element
-				n.staticRoutes = n.staticRoutes[:lastIndex]
-				break
-			}
+	n.mu.Lock()
+	lastIndex := len(n.staticRoutes) - 1
+	for i, v := range n.staticRoutes {
+		if v == r {
+			// Overwrite the route we're removing with the last element
+			n.staticRoutes[i] = n.staticRoutes[lastIndex]
+			// Shorten the slice to trim the extra element
+			n.staticRoutes = n.staticRoutes[:lastIndex]
+			break
 		}
-		n.Unlock()
 	}
-	return err
+	n.mu.Unlock()
+	return nil
+}
+
+// SetDefaultRouteIPv4 sets up a connected route to 0.0.0.0 via the Interface
+// with srcName, if that Interface has a route to 0.0.0.0. Otherwise, it
+// returns an error.
+func (n *Namespace) SetDefaultRouteIPv4(srcName string) error {
+	if err := n.setDefaultRoute(srcName, func(ipNet *net.IPNet) bool {
+		return ipNet.IP.IsUnspecified() && ipNet.IP.To4() != nil
+	}); err != nil {
+		return fmt.Errorf("setting IPv4 default route to interface with srcName '%s': %w", srcName, err)
+	}
+
+	n.mu.Lock()
+	n.defRoute4SrcName = srcName
+	n.mu.Unlock()
+	return nil
+}
+
+// SetDefaultRouteIPv6 sets up a connected route to [::] via the Interface
+// with srcName, if that Interface has a route to [::]. Otherwise, it
+// returns an error.
+func (n *Namespace) SetDefaultRouteIPv6(srcName string) error {
+	if err := n.setDefaultRoute(srcName, func(ipNet *net.IPNet) bool {
+		return ipNet.IP.IsUnspecified() && ipNet.IP.To4() == nil
+	}); err != nil {
+		return fmt.Errorf("setting IPv6 default route to interface with srcName '%s': %w", srcName, err)
+	}
+
+	n.mu.Lock()
+	n.defRoute6SrcName = srcName
+	n.mu.Unlock()
+	return nil
+}
+
+func (n *Namespace) setDefaultRoute(srcName string, routeMatcher func(*net.IPNet) bool) error {
+	iface := n.ifaceBySrcName(srcName)
+	if iface == nil {
+		return fmt.Errorf("no interface")
+	}
+
+	ridx := slices.IndexFunc(iface.routes, routeMatcher)
+	if ridx == -1 {
+		return fmt.Errorf("no default route")
+	}
+
+	link, err := n.nlHandle.LinkByName(iface.dstName)
+	if err != nil {
+		return fmt.Errorf("no link src:%s dst:%s", srcName, iface.dstName)
+	}
+
+	if err := n.nlHandle.RouteAdd(&netlink.Route{
+		Scope:     netlink.SCOPE_LINK,
+		LinkIndex: link.Attrs().Index,
+		Dst:       iface.routes[ridx],
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// UnsetDefaultRouteIPv4 unsets the previously set default IPv4 default route
+// in the sandbox. It is a no-op if no gateway was set.
+func (n *Namespace) UnsetDefaultRouteIPv4() error {
+	n.mu.Lock()
+	srcName := n.defRoute4SrcName
+	n.mu.Unlock()
+
+	if err := n.unsetDefaultRoute(srcName, func(ipNet *net.IPNet) bool {
+		return ipNet.IP.IsUnspecified() && ipNet.IP.To4() != nil
+	}); err != nil {
+		return fmt.Errorf("removing IPv4 default route to interface with srcName '%s': %w", srcName, err)
+	}
+
+	n.mu.Lock()
+	n.defRoute4SrcName = ""
+	n.mu.Unlock()
+	return nil
+}
+
+// UnsetDefaultRouteIPv6 unsets the previously set default IPv6 default route
+// in the sandbox. It is a no-op if no gateway was set.
+func (n *Namespace) UnsetDefaultRouteIPv6() error {
+	n.mu.Lock()
+	srcName := n.defRoute6SrcName
+	n.mu.Unlock()
+
+	if err := n.unsetDefaultRoute(srcName, func(ipNet *net.IPNet) bool {
+		return ipNet.IP.IsUnspecified() && ipNet.IP.To4() == nil
+	}); err != nil {
+		return fmt.Errorf("removing IPv6 default route to interface with srcName '%s': %w", srcName, err)
+	}
+
+	n.mu.Lock()
+	n.defRoute6SrcName = ""
+	n.mu.Unlock()
+	return nil
+}
+
+func (n *Namespace) unsetDefaultRoute(srcName string, routeMatcher func(*net.IPNet) bool) error {
+	if srcName == "" {
+		return nil
+	}
+
+	iface := n.ifaceBySrcName(srcName)
+	if iface == nil {
+		return nil
+	}
+
+	ridx := slices.IndexFunc(iface.routes, routeMatcher)
+	if ridx == -1 {
+		return fmt.Errorf("no default route")
+	}
+
+	link, err := n.nlHandle.LinkByName(iface.dstName)
+	if err != nil {
+		return fmt.Errorf("no link")
+	}
+
+	return n.nlHandle.RouteDel(&netlink.Route{
+		Scope:     netlink.SCOPE_LINK,
+		LinkIndex: link.Attrs().Index,
+		Dst:       iface.routes[ridx],
+	})
 }

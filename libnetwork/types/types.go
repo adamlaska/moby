@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
+	"github.com/docker/docker/errdefs"
 	"github.com/ishidawataru/sctp"
 )
 
@@ -27,9 +29,6 @@ type EncryptionKey struct {
 	LamportTime uint64
 }
 
-// UUID represents a globally unique ID of various resources like network and endpoint
-type UUID string
-
 // QosPolicy represents a quality of service policy on an endpoint
 type QosPolicy struct {
 	MaxEgressBandwidth uint64
@@ -41,7 +40,7 @@ type TransportPort struct {
 	Port  uint16
 }
 
-// Equal checks if this instance of Transportport is equal to the passed one
+// Equal checks if this instance of TransportPort is equal to the passed one
 func (t *TransportPort) Equal(o *TransportPort) bool {
 	if t == o {
 		return true
@@ -88,7 +87,7 @@ func (p PortBinding) HostAddr() (net.Addr, error) {
 	case SCTP:
 		return &sctp.SCTPAddr{IPAddrs: []net.IPAddr{{IP: p.HostIP}}, Port: int(p.HostPort)}, nil
 	default:
-		return nil, ErrInvalidProtocolBinding(p.Proto.String())
+		return nil, fmt.Errorf("invalid transport protocol: %s", p.Proto.String())
 	}
 }
 
@@ -102,7 +101,7 @@ func (p PortBinding) ContainerAddr() (net.Addr, error) {
 	case SCTP:
 		return &sctp.SCTPAddr{IPAddrs: []net.IPAddr{{IP: p.IP}}, Port: int(p.Port)}, nil
 	default:
-		return nil, ErrInvalidProtocolBinding(p.Proto.String())
+		return nil, fmt.Errorf("invalid transport protocol: %s", p.Proto.String())
 	}
 }
 
@@ -118,63 +117,48 @@ func (p *PortBinding) GetCopy() PortBinding {
 	}
 }
 
-// String returns the PortBinding structure in string form
-func (p *PortBinding) String() string {
-	ret := fmt.Sprintf("%s/", p.Proto)
-	if p.IP != nil {
-		ret += p.IP.String()
-	}
-	ret = fmt.Sprintf("%s:%d/", ret, p.Port)
-	if p.HostIP != nil {
-		ret += p.HostIP.String()
-	}
-	ret = fmt.Sprintf("%s:%d", ret, p.HostPort)
-	return ret
-}
-
-// Equal checks if this instance of PortBinding is equal to the passed one
-func (p *PortBinding) Equal(o *PortBinding) bool {
-	if p == o {
-		return true
-	}
-
-	if o == nil {
-		return false
-	}
-
-	if p.Proto != o.Proto || p.Port != o.Port ||
-		p.HostPort != o.HostPort || p.HostPortEnd != o.HostPortEnd {
-		return false
-	}
-
-	if p.IP != nil {
-		if !p.IP.Equal(o.IP) {
-			return false
+// String returns the PortBinding structure in the form "HostIP:HostPort:IP:Port/Proto",
+// omitting un-set fields apart from Port.
+func (p PortBinding) String() string {
+	var ret strings.Builder
+	if len(p.HostIP) > 0 {
+		is6 := p.HostIP.To4() == nil
+		if is6 {
+			ret.WriteRune('[')
 		}
-	} else {
-		if o.IP != nil {
-			return false
+		ret.WriteString(p.HostIP.String())
+		if is6 {
+			ret.WriteRune(']')
+		}
+		ret.WriteRune(':')
+	}
+	if p.HostPort != 0 {
+		ret.WriteString(strconv.Itoa(int(p.HostPort)))
+		if p.HostPortEnd != 0 && p.HostPortEnd != p.HostPort {
+			ret.WriteRune('-')
+			ret.WriteString(strconv.Itoa(int(p.HostPortEnd)))
 		}
 	}
-
-	if p.HostIP != nil {
-		if !p.HostIP.Equal(o.HostIP) {
-			return false
-		}
-	} else {
-		if o.HostIP != nil {
-			return false
-		}
+	if ret.Len() > 0 {
+		ret.WriteRune(':')
 	}
-
-	return true
-}
-
-// ErrInvalidProtocolBinding is returned when the port binding protocol is not valid.
-type ErrInvalidProtocolBinding string
-
-func (ipb ErrInvalidProtocolBinding) Error() string {
-	return fmt.Sprintf("invalid transport protocol: %s", string(ipb))
+	if len(p.IP) > 0 {
+		is6 := p.IP.To4() == nil
+		if is6 {
+			ret.WriteRune('[')
+		}
+		ret.WriteString(p.IP.String())
+		if is6 {
+			ret.WriteRune(']')
+		}
+		ret.WriteRune(':')
+	}
+	ret.WriteString(strconv.Itoa(int(p.Port)))
+	if p.Proto != 0 {
+		ret.WriteRune('/')
+		ret.WriteString(p.Proto.String())
+	}
+	return ret.String()
 }
 
 const (
@@ -202,7 +186,7 @@ func (p Protocol) String() string {
 	case SCTP:
 		return "sctp"
 	default:
-		return fmt.Sprintf("%d", p)
+		return strconv.Itoa(int(p))
 	}
 }
 
@@ -273,16 +257,6 @@ func CompareIPNet(a, b *net.IPNet) bool {
 	return a.IP.Equal(b.IP) && bytes.Equal(a.Mask, b.Mask)
 }
 
-// GetMinimalIP returns the address in its shortest form
-// If ip contains an IPv4-mapped IPv6 address, the 4-octet form of the IPv4 address will be returned.
-// Otherwise ip is returned unchanged.
-func GetMinimalIP(ip net.IP) net.IP {
-	if ip != nil && ip.To4() != nil {
-		return ip.To4()
-	}
-	return ip
-}
-
 // IsIPNetValid returns true if the ipnet is a valid network/mask
 // combination. Otherwise returns false.
 func IsIPNetValid(nw *net.IPNet) bool {
@@ -294,7 +268,7 @@ var v4inV6MaskPrefix = []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x
 // compareIPMask checks if the passed ip and mask are semantically compatible.
 // It returns the byte indexes for the address and mask so that caller can
 // do bitwise operations without modifying address representation.
-func compareIPMask(ip net.IP, mask net.IPMask) (is int, ms int, err error) {
+func compareIPMask(ip net.IP, mask net.IPMask) (is int, ms int, _ error) {
 	// Find the effective starting of address and mask
 	if len(ip) == net.IPv6len && ip.To4() != nil {
 		is = 12
@@ -304,9 +278,9 @@ func compareIPMask(ip net.IP, mask net.IPMask) (is int, ms int, err error) {
 	}
 	// Check if address and mask are semantically compatible
 	if len(ip[is:]) != len(mask[ms:]) {
-		err = fmt.Errorf("ip and mask are not compatible: (%#v, %#v)", ip, mask)
+		return 0, 0, fmt.Errorf("ip and mask are not compatible: (%s, %s)", ip, mask)
 	}
-	return
+	return is, ms, nil
 }
 
 // GetHostPartIP returns the host portion of the ip address identified by the mask.
@@ -378,9 +352,10 @@ type StaticRoute struct {
 func (r *StaticRoute) GetCopy() *StaticRoute {
 	d := GetIPNetCopy(r.Destination)
 	nh := GetIPCopy(r.NextHop)
-	return &StaticRoute{Destination: d,
-		RouteType: r.RouteType,
-		NextHop:   nh,
+	return &StaticRoute{
+		Destination: d,
+		RouteType:   r.RouteType,
+		NextHop:     nh,
 	}
 }
 
@@ -411,47 +386,20 @@ type MaskableError interface {
 	Maskable()
 }
 
-// RetryError is an interface for errors which might get resolved through retry
-type RetryError interface {
-	// Retry makes implementer into RetryError type
-	Retry()
-}
-
-// BadRequestError is an interface for errors originated by a bad request
-type BadRequestError interface {
-	// BadRequest makes implementer into BadRequestError type
-	BadRequest()
-}
+// InvalidParameterError is an interface for errors originated by a bad request
+type InvalidParameterError = errdefs.ErrInvalidParameter
 
 // NotFoundError is an interface for errors raised because a needed resource is not available
-type NotFoundError interface {
-	// NotFound makes implementer into NotFoundError type
-	NotFound()
-}
+type NotFoundError = errdefs.ErrNotFound
 
 // ForbiddenError is an interface for errors which denote a valid request that cannot be honored
-type ForbiddenError interface {
-	// Forbidden makes implementer into ForbiddenError type
-	Forbidden()
-}
+type ForbiddenError = errdefs.ErrForbidden
 
-// NoServiceError is an interface for errors returned when the required service is not available
-type NoServiceError interface {
-	// NoService makes implementer into NoServiceError type
-	NoService()
-}
-
-// TimeoutError is an interface for errors raised because of timeout
-type TimeoutError interface {
-	// Timeout makes implementer into TimeoutError type
-	Timeout()
-}
+// UnavailableError is an interface for errors returned when the required service is not available
+type UnavailableError = errdefs.ErrUnavailable
 
 // NotImplementedError is an interface for errors raised because of requested functionality is not yet implemented
-type NotImplementedError interface {
-	// NotImplemented makes implementer into NotImplementedError type
-	NotImplemented()
-}
+type NotImplementedError = errdefs.ErrNotImplemented
 
 // InternalError is an interface for errors raised because of an internal error
 type InternalError interface {
@@ -463,34 +411,29 @@ type InternalError interface {
  * Well-known Error Formatters
  ******************************/
 
-// BadRequestErrorf creates an instance of BadRequestError
-func BadRequestErrorf(format string, params ...interface{}) error {
-	return badRequest(fmt.Sprintf(format, params...))
+// InvalidParameterErrorf creates an instance of InvalidParameterError
+func InvalidParameterErrorf(format string, params ...interface{}) error {
+	return errdefs.InvalidParameter(fmt.Errorf(format, params...))
 }
 
 // NotFoundErrorf creates an instance of NotFoundError
 func NotFoundErrorf(format string, params ...interface{}) error {
-	return notFound(fmt.Sprintf(format, params...))
+	return errdefs.NotFound(fmt.Errorf(format, params...))
 }
 
 // ForbiddenErrorf creates an instance of ForbiddenError
 func ForbiddenErrorf(format string, params ...interface{}) error {
-	return forbidden(fmt.Sprintf(format, params...))
+	return errdefs.Forbidden(fmt.Errorf(format, params...))
 }
 
-// NoServiceErrorf creates an instance of NoServiceError
-func NoServiceErrorf(format string, params ...interface{}) error {
-	return noService(fmt.Sprintf(format, params...))
+// UnavailableErrorf creates an instance of UnavailableError
+func UnavailableErrorf(format string, params ...interface{}) error {
+	return errdefs.Unavailable(fmt.Errorf(format, params...))
 }
 
 // NotImplementedErrorf creates an instance of NotImplementedError
 func NotImplementedErrorf(format string, params ...interface{}) error {
-	return notImpl(fmt.Sprintf(format, params...))
-}
-
-// TimeoutErrorf creates an instance of TimeoutError
-func TimeoutErrorf(format string, params ...interface{}) error {
-	return timeout(fmt.Sprintf(format, params...))
+	return errdefs.NotImplemented(fmt.Errorf(format, params...))
 }
 
 // InternalErrorf creates an instance of InternalError
@@ -503,55 +446,9 @@ func InternalMaskableErrorf(format string, params ...interface{}) error {
 	return maskInternal(fmt.Sprintf(format, params...))
 }
 
-// RetryErrorf creates an instance of RetryError
-func RetryErrorf(format string, params ...interface{}) error {
-	return retry(fmt.Sprintf(format, params...))
-}
-
 /***********************
  * Internal Error Types
  ***********************/
-type badRequest string
-
-func (br badRequest) Error() string {
-	return string(br)
-}
-func (br badRequest) BadRequest() {}
-
-type notFound string
-
-func (nf notFound) Error() string {
-	return string(nf)
-}
-func (nf notFound) NotFound() {}
-
-type forbidden string
-
-func (frb forbidden) Error() string {
-	return string(frb)
-}
-func (frb forbidden) Forbidden() {}
-
-type noService string
-
-func (ns noService) Error() string {
-	return string(ns)
-}
-func (ns noService) NoService() {}
-
-type timeout string
-
-func (to timeout) Error() string {
-	return string(to)
-}
-func (to timeout) Timeout() {}
-
-type notImpl string
-
-func (ni notImpl) Error() string {
-	return string(ni)
-}
-func (ni notImpl) NotImplemented() {}
 
 type internal string
 
@@ -567,10 +464,3 @@ func (mnt maskInternal) Error() string {
 }
 func (mnt maskInternal) Internal() {}
 func (mnt maskInternal) Maskable() {}
-
-type retry string
-
-func (r retry) Error() string {
-	return string(r)
-}
-func (r retry) Retry() {}

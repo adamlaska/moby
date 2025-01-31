@@ -5,7 +5,8 @@ import (
 	"time"
 
 	eventtypes "github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/pkg/pubsub"
+	"github.com/docker/docker/internal/metrics"
+	"github.com/moby/pubsub"
 )
 
 const (
@@ -33,7 +34,7 @@ func New() *Events {
 // of interface{}, so you need type assertion), and a function to call
 // to stop the stream of events.
 func (e *Events) Subscribe() ([]eventtypes.Message, chan interface{}, func()) {
-	eventSubscribers.Inc()
+	metrics.EventSubscribers.Inc()
 	e.mu.Lock()
 	current := make([]eventtypes.Message, len(e.events))
 	copy(current, e.events)
@@ -50,7 +51,7 @@ func (e *Events) Subscribe() ([]eventtypes.Message, chan interface{}, func()) {
 // last events, a channel in which you can expect new events (in form
 // of interface{}, so you need type assertion).
 func (e *Events) SubscribeTopic(since, until time.Time, ef *Filter) ([]eventtypes.Message, chan interface{}) {
-	eventSubscribers.Inc()
+	metrics.EventSubscribers.Inc()
 	e.mu.Lock()
 
 	var topic func(m interface{}) bool
@@ -74,12 +75,12 @@ func (e *Events) SubscribeTopic(since, until time.Time, ef *Filter) ([]eventtype
 
 // Evict evicts listener from pubsub
 func (e *Events) Evict(l chan interface{}) {
-	eventSubscribers.Dec()
+	metrics.EventSubscribers.Dec()
 	e.pub.Evict(l)
 }
 
 // Log creates a local scope message and publishes it
-func (e *Events) Log(action string, eventType eventtypes.Type, actor eventtypes.Actor) {
+func (e *Events) Log(action eventtypes.Action, eventType eventtypes.Type, actor eventtypes.Actor) {
 	now := time.Now().UTC()
 	jm := eventtypes.Message{
 		Action:   action,
@@ -94,11 +95,11 @@ func (e *Events) Log(action string, eventType eventtypes.Type, actor eventtypes.
 	switch eventType {
 	case eventtypes.ContainerEventType:
 		jm.ID = actor.ID
-		jm.Status = action
+		jm.Status = string(action)
 		jm.From = actor.Attributes["image"]
 	case eventtypes.ImageEventType:
 		jm.ID = actor.ID
-		jm.Status = action
+		jm.Status = string(action)
 	}
 
 	e.PublishMessage(jm)
@@ -107,7 +108,7 @@ func (e *Events) Log(action string, eventType eventtypes.Type, actor eventtypes.
 // PublishMessage broadcasts event to listeners. Each listener has 100 milliseconds to
 // receive the event or it will be skipped.
 func (e *Events) PublishMessage(jm eventtypes.Message) {
-	eventsCounter.Inc()
+	metrics.EventsCounter.Inc()
 
 	e.mu.Lock()
 	if len(e.events) == cap(e.events) {

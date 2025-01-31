@@ -1,19 +1,22 @@
 //go:build windows
-// +build windows
 
 package windows
 
 import (
+	"context"
 	"net"
 	"testing"
 
+	"github.com/docker/docker/internal/testutils/storeutils"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/libnetwork/types"
+	"gotest.tools/v3/assert"
 )
 
 func testNetwork(networkType string, t *testing.T) {
-	d := newDriver(networkType)
+	d, err := newDriver(networkType, storeutils.NewTempStore(t))
+	assert.NilError(t, err)
 	bnw, _ := types.ParseCIDR("172.16.0.0/24")
 	br, _ := types.ParseCIDR("172.16.0.1/16")
 
@@ -30,7 +33,7 @@ func testNetwork(networkType string, t *testing.T) {
 		},
 	}
 
-	err := d.CreateNetwork("dummy", netOption, nil, ipdList, nil)
+	err = d.CreateNetwork("dummy", netOption, nil, ipdList, nil)
 	if err != nil {
 		t.Fatalf("Failed to create bridge: %v", err)
 	}
@@ -43,7 +46,7 @@ func testNetwork(networkType string, t *testing.T) {
 
 	epOptions := make(map[string]interface{})
 	te := &testEndpoint{}
-	err = d.CreateEndpoint("dummy", "ep1", te.Interface(), epOptions)
+	err = d.CreateEndpoint(context.TODO(), "dummy", "ep1", te.Interface(), epOptions)
 	if err != nil {
 		t.Fatalf("Failed to create an endpoint : %s", err.Error())
 	}
@@ -104,7 +107,7 @@ func (test *testEndpoint) SetMacAddress(mac net.HardwareAddr) error {
 	}
 
 	if mac == nil {
-		return types.BadRequestErrorf("tried to set nil MAC address to endpoint interface")
+		return types.InvalidParameterErrorf("tried to set nil MAC address to endpoint interface")
 	}
 	test.macAddress = mac.String()
 	return nil
@@ -112,7 +115,7 @@ func (test *testEndpoint) SetMacAddress(mac net.HardwareAddr) error {
 
 func (test *testEndpoint) SetIPAddress(address *net.IPNet) error {
 	if address.IP == nil {
-		return types.BadRequestErrorf("tried to set nil IP address to endpoint interface")
+		return types.InvalidParameterErrorf("tried to set nil IP address to endpoint interface")
 	}
 
 	test.address = address.String()
@@ -141,4 +144,11 @@ func (test *testEndpoint) AddStaticRoute(destination *net.IPNet, routeType int, 
 
 func (test *testEndpoint) DisableGatewayService() {
 	test.disableGatewayService = true
+}
+
+func (test *testEndpoint) NetnsPath() string {
+	return ""
+}
+
+func (test *testEndpoint) SetCreatedInContainer(bool) {
 }

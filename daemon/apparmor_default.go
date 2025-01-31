@@ -1,12 +1,11 @@
 //go:build linux
-// +build linux
 
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"fmt"
 
-	"github.com/containerd/containerd/pkg/apparmor"
+	"github.com/containerd/containerd/v2/pkg/apparmor"
 	aaprofile "github.com/docker/docker/profiles/apparmor"
 )
 

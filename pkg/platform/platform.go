@@ -1,23 +1,27 @@
+// Package platform provides helper function to get the runtime architecture
+// for different platforms.
+//
+// Deprecated: this package is only used internally, and will be removed in the next release.
 package platform // import "github.com/docker/docker/pkg/platform"
 
 import (
-	"runtime"
-
-	"github.com/sirupsen/logrus"
+	"github.com/docker/docker/internal/platform"
 )
 
-var (
-	// Architecture holds the runtime architecture of the process.
-	Architecture string
-	// OSType holds the runtime operating system type (Linux, …) of the process.
-	OSType string
-)
+// Architecture holds the runtime architecture of the process.
+//
+// Unlike [runtime.GOARCH] (which refers to the compiler platform),
+// Architecture refers to the running platform.
+//
+// For example, Architecture reports "x86_64" as architecture, even
+// when running a "linux/386" compiled binary on "linux/amd64" hardware.
+//
+// Deprecated: this package is only used internally, and will be removed in the next release.
+var Architecture = platform.Architecture()
 
-func init() {
-	var err error
-	Architecture, err = runtimeArchitecture()
-	if err != nil {
-		logrus.Errorf("Could not read system architecture info: %v", err)
-	}
-	OSType = runtime.GOOS
+// NumProcs returns the number of processors on the system
+//
+// Deprecated: this package is only used internally, and will be removed in the next release.
+func NumProcs() uint32 {
+	return platform.NumProcs()
 }

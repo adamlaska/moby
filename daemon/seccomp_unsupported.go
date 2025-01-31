@@ -1,13 +1,12 @@
 //go:build !linux
-// +build !linux
 
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"context"
 
-	"github.com/containerd/containerd/containers"
-	coci "github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/docker/docker/container"
 )
 
